@@ -1,4 +1,4 @@
-# CED dependencies — offline-first, CPU-friendly.
+# DeepSeek CED dependencies — offline-first, CPU-friendly.
 # Install: pip install -r requirements.txt
 # Smoke:   pytest -q && python3 -m src.ced_llm.train --smoke && python3 -m src.ced_llm.generate --smoke
 # See README.md (Quickstart) + CONTRIBUTING.md (no new REQUIRED deps without fallback).

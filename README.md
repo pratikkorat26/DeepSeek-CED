@@ -1,4 +1,4 @@
-# CED: Minimal Dense Context-Encoder-Decoder LLM ⚡📚
+# DeepSeek CED: Minimal Dense Context-Encoder-Decoder LLM ⚡📚
 
 [![python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](pyproject.toml)
 [![torch](https://img.shields.io/badge/torch-%3E%3D2.0-orange)](requirements.txt)
