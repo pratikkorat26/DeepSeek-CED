@@ -29,6 +29,8 @@ runs/
 # Ship-crew internal docs (do not publish)
 THUNDERDOME_*.md
 SHIP_*.md
+FORGE_*.md
+SPEED_*.md
 
 # OS / editor
 .DS_Store
