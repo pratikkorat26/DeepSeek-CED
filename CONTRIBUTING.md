@@ -42,7 +42,7 @@ No internet? No problem. Everything falls back to synthetic data + word-level
 tokenizer. If your change NEEDS the network, it will be rejected with prejudice
 and a haiku.
 
-## 3. The CED contracts (violations fail CI and hearts)
+## 3. The CED contracts (violations fail tests and hearts)
 
 1. **Encoder runs ONCE per generation.** `init_decode_cache` → one forward.
    `forward_step` never re-encodes. `encoder_forward_count` delta must be 1.
