@@ -6,14 +6,15 @@
 # --- Core (REQUIRED) ---
 # torch: model + train + generate (SDPA attention needs torch>=2.0).
 torch>=2.0
-# pytest: test runner (pytest -q must stay 43/43 green).
+# pytest: test runner (pytest -q must stay 49/49 green).
 pytest
 
 # --- Optional (FALLBACK-COVERED: safe to skip; repo works fully offline without them) ---
 # datasets: real TinyStories via HF; synthetic fallback if missing/offline.
 #   Proven by test_tinystories_loader_fallback_offline (imports force-broken, still green).
 datasets
-# tiktoken: GPT-2 encoding probe only; SimpleTokenizer (offline word-level) used otherwise.
+# tiktoken: --tokenizer gpt2 BPE (50k+1); missing package/BPE falls back to
+#   SimpleTokenizer with a warning (offline-safe, proven by test_tokenizer.py).
 tiktoken
 # tensorboard: `train --tensorboard` / TensorBoard mirroring of run metrics.
 #   Missing package only warns; JSONL logs in runs/ always work.

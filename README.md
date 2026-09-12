@@ -25,7 +25,7 @@ buy GPUs. (Turbo tried. Chaos cast spells. Docs won anyway.)
 pip install -r requirements.txt
 # torch>=2.0 and pytest are required; datasets/tiktoken are optional (fallback-covered)
 
-pytest -q                                        # 43 tests, ~2s, all green or riot
+pytest -q                                        # 49 tests, ~3s, all green or riot
 python3 -m src.ced_llm.train --smoke             # toy run: asserts loss goes DOWN
 python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encoder runs x1
 ```
@@ -33,7 +33,7 @@ python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encode
 Expected smoke output (don't panic if numbers wiggle slightly by torch version):
 
 ```
- 43 passed in ~2.5s
+ 49 passed in ~2.8s
 [train] SMOKE OK (loss 6.25 -> 4.83, the line goes down, stonks 📉📈)
 [generate] SMOKE OK (tokens=... encoder_forwards=1, the encoder took ONE nap... er, pass)
 ```
@@ -91,6 +91,22 @@ python3 examples/moe_asymmetry.py   # SEE the asymmetry: prefill-active vs
 Dense stays default (`--moe` off = bit-identical). The demo prints the
 signature V4.1 shape: prefill activates the encoder subset, decode the
 decoder subset (~24% vs ~27% of params at toy scale; theirs: 8B/16B).
+
+### Tokenizer (word-level default, GPT-2 BPE opt-in)
+
+Default is the offline `SimpleTokenizer` (word-level, 8k cap, zero downloads).
+Pass `--tokenizer gpt2` for real BPE subwords — no more `<unk>` spam:
+
+```bash
+pip install tiktoken   # once (+ one-time BPE download); else clean fallback
+python3 -m src.ced_llm.train --data tinystories --steps 500 \
+  --tokenizer gpt2 --ckpt ckpt-bpe.pt
+```
+
+Footprint: vocab 50,258 (50,257 BPE + 1 pad row) ≈ 26 MB fp32 per embedding
+matrix at d_model=128 — laptop-safe. Checkpoints record `tokenizer_kind`
+so generate/eval rebuild the same tokenizer (with a loud warning + graceful
+fallback if tiktoken is missing).
 
 ---
 
@@ -155,7 +171,7 @@ MPS tiny-shape timing is noisy ±15–30%, CPU is stable):
 
 | Workload | Command | Apple M4 result |
 |---|---|---|
-| Full test suite (43 tests) | `pytest -q` | ~2.5s, 43/43 green |
+| Full test suite (49 tests) | `pytest -q` | ~2.8s, 49/49 green |
 | Train smoke (60 toy steps) | `python3 -m src.ced_llm.train --smoke` | loss `6.25 → 4.83`, asserts final < initial |
 | Generate smoke (16 tokens) | `python3 -m src.ced_llm.generate --smoke` | `encoder_forwards=1`, proves KV-reuse |
 | Train, MPS (d=128, 2+2, B=8, T=128) | `benchmarks/speed.py --device mps` | **~89k tok/s** (11.4 ms/step) |
@@ -276,6 +292,7 @@ tests/test_edgecases_docs.py  # DOC-BOSS: empty prompt, single token, truncation
 tests/test_tracking.py      # RunTracker layout, disabled mode, TB fallback, smoke end-to-end
 tests/test_optim.py         # Newton-Schulz band, Muon descent, hybrid routing, muon smoke
 tests/test_moe.py           # sqrtsoftplus, top-k+renorm, shared always-on, noaux bias, moe smoke
+tests/test_tokenizer.py     # GPT-2 wrapper (stubbed tiktoken), offline fallback, ckpt kind roundtrip
 examples/moe_asymmetry.py   # prefill vs decode active params + live expert histogram
 ARCHITECTURE.md           # Deep dive: encoder-once + KV-reuse with ASCII traces
 CONTRIBUTING.md           # How to contribute without summoning demons

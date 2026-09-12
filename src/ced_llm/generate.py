@@ -1361,15 +1361,30 @@ def _try_load_ckpt(ckpt_path, device="cpu"):
             model.load_state_dict(ms, strict=False)
     except Exception as e:
         print("[generate] WARNING: ckpt load_state_dict failed: %r" % (e,), file=sys.stderr)
-    # Tokenizer.
+    # Tokenizer: gpt2 kind rebuilds BPE (needs tiktoken), else legacy vocab dict.
     tok = None
     try:
-        tv = data.get("tokenizer_vocab", None)
-        if tv is not None and SimpleTokenizer is not None:
-            if isinstance(tv, dict) and "token_to_id" in tv:
-                tok = SimpleTokenizer.from_dict(tv)
-            elif isinstance(tv, dict):
-                tok = SimpleTokenizer.from_vocab(tv)
+        if data.get("tokenizer_kind", None) == "gpt2":
+            try:
+                try:
+                    from .data import build_tokenizer as _bt
+                except Exception:
+                    from src.ced_llm.data import build_tokenizer as _bt  # type: ignore
+                tok, _kind = _bt("gpt2")
+                if _kind != "gpt2" or tok is None:
+                    print("[generate] WARNING: ckpt needs GPT-2 BPE but tiktoken "
+                          "is unavailable; tokenizer set to None (pip install "
+                          "tiktoken to fix).", file=sys.stderr)
+                    tok = None
+            except Exception:
+                tok = None
+        if tok is None:
+            tv = data.get("tokenizer_vocab", None)
+            if tv is not None and SimpleTokenizer is not None:
+                if isinstance(tv, dict) and "token_to_id" in tv:
+                    tok = SimpleTokenizer.from_dict(tv)
+                elif isinstance(tv, dict):
+                    tok = SimpleTokenizer.from_vocab(tv)
     except Exception:
         tok = None
     return model, tok, cfg_d

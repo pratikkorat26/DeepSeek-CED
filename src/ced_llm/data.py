@@ -163,6 +163,107 @@ def try_load_gpt2_tokenizer():
         return None
 
 
+class GPT2Tokenizer:
+    """GPT-2 BPE via tiktoken, wrapped in the SimpleTokenizer interface.
+
+    Requires ``pip install tiktoken`` AND the cached BPE file (one-time
+    download); construction returns None-safe via :func:`build_tokenizer`
+    which falls back to :class:`SimpleTokenizer` offline.
+
+    Conventions (documented deltas vs SimpleTokenizer):
+      * ``eos_id = n_vocab - 1`` (50256 ``<|endoftext|>`` for real GPT-2);
+        ``bos_id = None`` (GPT-2 has no BOS, so ``encode_pack`` adds none);
+        ``unk_id = None`` (BPE has no OOV -- every byte sequence encodes).
+      * ``pad_id = n_vocab``: one row PAST the BPE vocab, so padding never
+        collides with real tokens (masks compare ids to pad). The model
+        embedding is therefore sized ``vocab_size = n_vocab + 1`` (50258 for
+        GPT-2; ~25.7 MB fp32 at d_model=128 -- laptop-safe).
+      * ``decode`` delegates to tiktoken (full fidelity, no skipping).
+    """
+
+    kind = "gpt2"
+    name = "gpt2"
+
+    def __init__(self, enc):
+        self._enc = enc
+        try:
+            base = int(enc.n_vocab)
+        except Exception:
+            base = 50257
+        self.base_vocab = base
+        self.eos_id = base - 1
+        self.eos_token_id = base - 1
+        self.pad_id = base
+        self.pad_token_id = base
+        self.bos_id = None
+        self.unk_id = None
+        self.vocab_size = base + 1
+
+    def encode(self, text):
+        try:
+            return list(self._enc.encode(str(text), disallowed_special=()))
+        except TypeError:
+            try:
+                return list(self._enc.encode(str(text)))
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+    def decode(self, ids):
+        try:
+            import torch as _torch
+
+            if isinstance(ids, _torch.Tensor):
+                ids = ids.tolist()
+        except Exception:
+            pass
+        try:
+            return self._enc.decode([int(i) for i in ids])
+        except Exception:
+            return ""
+
+    def __len__(self):
+        return self.vocab_size
+
+    def to_dict(self):
+        return {"kind": "gpt2", "name": "gpt2", "vocab_size": self.vocab_size}
+
+    @classmethod
+    def from_dict(cls, d):
+        enc = try_load_gpt2_tokenizer()
+        if enc is None:
+            return None
+        return cls(enc)
+
+
+def build_tokenizer(kind="simple", texts=None, vocab_size=8000):
+    """Build (tokenizer, actual_kind). ``gpt2`` falls back to simple offline.
+
+    Never raises for missing deps: when tiktoken (or its BPE download) is
+    unavailable, prints a warning and returns a SimpleTokenizer.
+    """
+    try:
+        key = str(kind or "simple").strip().lower()
+    except Exception:
+        key = "simple"
+    if key in ("gpt2", "gpt-2", "gpt2-bpe"):
+        enc = try_load_gpt2_tokenizer()
+        if enc is not None:
+            try:
+                return GPT2Tokenizer(enc), "gpt2"
+            except Exception:
+                pass
+        print("[tok] WARNING: --tokenizer gpt2 requested but tiktoken (or its "
+              "BPE download) is unavailable; falling back to SimpleTokenizer "
+              "(pip install tiktoken + network once to enable).")
+    try:
+        cap = int(vocab_size)
+    except Exception:
+        cap = 8000
+    return SimpleTokenizer(texts, vocab_size=cap), "simple"
+
+
 # ---------------------------------------------------------------------------
 # TinyStories loading (with offline synthetic fallback)
 # ---------------------------------------------------------------------------

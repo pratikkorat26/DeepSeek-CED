@@ -957,6 +957,10 @@ def build_argparser():
                    help="experts active per token (V4.1-Flash: 6)")
     p.add_argument("--moe-shared", type=int, default=1,
                    help="always-on shared experts (V4.1-Flash: 1)")
+    p.add_argument("--tokenizer", type=str, default="simple",
+                   choices=["simple", "gpt2"],
+                   help="simple = offline word-level (default); gpt2 = BPE via "
+                        "tiktoken (needs install + one-time BPE download, else falls back)")
     # FORGE-LOOP speed flags (all defaults preserve CPU fp32 numerics exactly).
     p.add_argument("--device", type=str, default="cpu",
                    choices=["cpu", "mps", "cuda", "auto"],
@@ -1026,9 +1030,10 @@ def main(argv=None):
             "batch_size": batch_size, "lr": lr, "d_model": d_model,
             "n_enc": n_enc, "n_dec": n_dec, "nhead": nhead, "dim_ff": dim_ff,
             "vocab_size": vocab_size, "init_loss": float(init["loss"]),
-            "optimizer": str(getattr(args, "optimizer", "adamw")),
-            "muon_lr": float(getattr(args, "muon_lr", 0.02)),
-        })
+        "optimizer": str(getattr(args, "optimizer", "adamw")),
+        "muon_lr": float(getattr(args, "muon_lr", 0.02)),
+        "tokenizer": str(getattr(args, "tokenizer", "simple")),
+    })
         if tracker is not None and getattr(tracker, "active", False):
             print("[track] run dir: %s" % tracker.dir)
             tracker.log(0, {"loss": float(init["loss"]), "ppl": float(init["ppl"])})
@@ -1096,6 +1101,7 @@ def main(argv=None):
                         "model_state": model.state_dict(),
                         "config": _config_to_dict(config),
                         "vocab_size": vocab_size,
+                        "tokenizer_kind": "simple",
                     },
                     args.ckpt,
                 )
@@ -1140,7 +1146,18 @@ def main(argv=None):
             sample_texts = []
         if not sample_texts:
             sample_texts = ["Once upon a time there was a little bunny."]
-        tokenizer = SimpleTokenizer(sample_texts, vocab_size=8000)
+        try:
+            from .data import build_tokenizer as _build_tok
+        except Exception:
+            try:
+                from src.ced_llm.data import build_tokenizer as _build_tok  # type: ignore
+            except Exception:
+                _build_tok = None
+        if _build_tok is not None:
+            tokenizer, tok_kind = _build_tok(
+                getattr(args, "tokenizer", "simple"), sample_texts, 8000)
+        else:  # pragma: no cover - data import failed; legacy path
+            tokenizer, tok_kind = SimpleTokenizer(sample_texts, vocab_size=8000), "simple"
         vocab_size = int(tokenizer.vocab_size)
         try:
             _nw = int(getattr(args, "num_workers", 0) or 0)
@@ -1164,10 +1181,12 @@ def main(argv=None):
             pin_memory=bool(getattr(args, "pin_memory", False)),
         )
         tok_vocab = tokenizer.to_dict()
+        tok_kind = tok_kind if isinstance(tok_kind, str) else "simple"
     else:
         vocab_size = 512
         tokenizer = None
         tok_vocab = None
+        tok_kind = "simple"
         # Deterministic fixed toy stream (reused) for stable training.
         loader = _fixed_toy_loader(vocab_size, seq_len, batch_size, num_batches=16, seed=args.seed)
 
@@ -1192,6 +1211,7 @@ def main(argv=None):
         "log_every": log_every,
         "optimizer": str(getattr(args, "optimizer", "adamw")),
         "muon_lr": float(getattr(args, "muon_lr", 0.02)),
+        "tokenizer": str(getattr(args, "tokenizer", "simple")),
         "device": device, "dtype": _dtype,
     })
     if getattr(tracker, "active", False):
@@ -1267,6 +1287,10 @@ def main(argv=None):
             }
             if tok_vocab is not None:
                 payload["tokenizer_vocab"] = tok_vocab
+            try:
+                payload["tokenizer_kind"] = str(tok_kind)
+            except Exception:
+                pass
             torch.save(payload, args.ckpt)
             print("[train] saved ckpt to %s" % args.ckpt)
         except Exception as e:
