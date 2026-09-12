@@ -169,6 +169,42 @@ generates 2 prompts from it end to end.
 
 ---
 
+## 📈 Tracking (every run leaves footprints)
+
+Training (and optionally eval) logs to a timestamped run directory — no
+account, no server, no network. Just files:
+
+```bash
+python3 -m src.ced_llm.train --data tinystories --steps 500 --ckpt ckpt.pt
+# → runs/run-20260912-103000/{config.json, metrics.jsonl, summary.json}
+
+python3 -m src.ced_llm.train --smoke --run-name debug1   # custom run name
+python3 -m src.ced_llm.train --steps 500 --no-track      # disable logging
+python3 -m src.ced_llm.eval --ckpt ckpt.pt --run-dir runs --run-name eval1
+```
+
+* `config.json` — hyperparams + CLI args + git hash (best-effort).
+* `metrics.jsonl` — one JSON object per logged step (`--log-every N`,
+  default 20): `{"step": 20, "loss": 4.21, "lr": 0.00029}`.
+* `summary.json` — final aggregates (init/final loss, eval ppl, ckpt path).
+
+Compare runs with zero dependencies:
+
+```bash
+python3 -c "
+import json
+for run in ['runs/a', 'runs/b']:
+    rows = [json.loads(l) for l in open(run + '/metrics.jsonl')]
+    print(run, 'steps:', len(rows), 'last loss:', round(rows[-1].get('loss', 0), 4))
+"
+```
+
+Want live curves? `pip install tensorboard`, add `--tensorboard` to any
+tracked command, then `tensorboard --logdir runs`. Missing package only
+warns — the JSONL logs always work.
+
+---
+
 ## 🗺️ File map (know thy dungeon)
 
 ```
@@ -178,7 +214,9 @@ src/ced_llm/encoder.py    # CausalEncoder: stack of pre-norm blocks
 src/ced_llm/decoder.py    # CausalDecoder: self-attn + global cross-attn + FFN, KV-cache stepping
 src/ced_llm/model.py      # CEDForLM: embed ONCE, encode_once, init_decode_cache, forward_step
 src/ced_llm/data.py       # SimpleTokenizer, TinyStories loader + synthetic fallback, encode_pack
-src/ced_llm/train.py      # compute_loss / train_one_epoch / evaluate / CLI (--smoke toy run)
+src/ced_llm/train.py      # compute_loss / train_one_epoch / evaluate / CLI (--smoke toy run, --run-dir tracking)
+src/ced_llm/tracking.py   # RunTracker: offline JSONL runs + optional TensorBoard mirror
+src/ced_llm/eval.py       # perplexity + 3 samples CLI (--smoke, --ckpt, --run-dir)
 src/ced_llm/generate.py   # generate_greedy (cache-once + step loop) / sampling spells / CLI
 tests/test_causality.py   # Encoder + decoder self-attn causality proofs
 tests/test_data.py        # Tokenizer round-trip, pack, batch shapes, offline fallback
@@ -186,6 +224,7 @@ tests/test_generate.py    # Greedy determinism, KV-reuse counter, length-or-EOS-
 tests/test_kv_reuse.py    # Full-vs-incremental parity, ptr stability, global dependence
 tests/test_training.py    # Toy overfit, grad flow to encoder, padding invariance
 tests/test_edgecases_docs.py  # DOC-BOSS: empty prompt, single token, truncation, temp=0 (7 tests)
+tests/test_tracking.py      # RunTracker layout, disabled mode, TB fallback, smoke end-to-end
 ARCHITECTURE.md           # Deep dive: encoder-once + KV-reuse with ASCII traces
 CONTRIBUTING.md           # How to contribute without summoning demons
 requirements.txt          # torch+pytest required; datasets/tiktoken optional (commented)

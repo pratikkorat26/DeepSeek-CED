@@ -56,6 +56,58 @@ except Exception:
         get_toy_batch = _mod.get_toy_batch
         load_tinystories = _mod.load_tinystories
 
+# -- tracking import (same layout tolerance; no-op fallback keeps smoke alive) --
+try:
+    from .tracking import RunTracker, load_metrics  # type: ignore
+except Exception:
+    try:
+        from src.ced_llm.tracking import RunTracker, load_metrics  # type: ignore
+    except Exception:
+
+        class RunTracker:  # offline fallback: no-op tracker, same API
+            def __init__(self, *a, **k):
+                self.dir = None
+
+            @property
+            def active(self):
+                return False
+
+            def log(self, *a, **k):
+                return None
+
+            def close(self, *a, **k):
+                return None
+
+            @classmethod
+            def disabled(cls):
+                return cls()
+
+        def load_metrics(*a, **k):
+            return []
+
+
+def _new_tracker(args, extra_config):
+    """Build a RunTracker from CLI args (disabled with --no-track)."""
+    try:
+        if bool(getattr(args, "no_track", False)):
+            return RunTracker.disabled()
+        cfg = {"seed": int(getattr(args, "seed", 0))}
+        try:
+            cfg.update(dict(extra_config or {}))
+        except Exception:
+            pass
+        return RunTracker(
+            run_dir=getattr(args, "run_dir", "runs"),
+            run_name=getattr(args, "run_name", None),
+            config=cfg,
+            tensorboard=bool(getattr(args, "tensorboard", False)),
+        )
+    except Exception:
+        try:
+            return RunTracker.disabled()
+        except Exception:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Model loading: prefer real CED model, else fallback shim.
@@ -684,6 +736,17 @@ def build_argparser():
     p.add_argument("--n-enc", type=int, default=2)
     p.add_argument("--n-dec", type=int, default=2)
     p.add_argument("--nhead", type=int, default=4)
+    # Run tracking (offline JSONL by default; TensorBoard only with --tensorboard).
+    p.add_argument("--run-dir", type=str, default="runs",
+                   help="parent dir for tracked runs (each run gets a subdir)")
+    p.add_argument("--run-name", type=str, default=None,
+                   help="run subdir name (default: run-YYYYMMDD-HHMMSS)")
+    p.add_argument("--no-track", action="store_true",
+                   help="disable run tracking (no files written)")
+    p.add_argument("--tensorboard", action="store_true",
+                   help="mirror scalars to TensorBoard (needs pip install tensorboard)")
+    p.add_argument("--log-every", type=int, default=20,
+                   help="log a metrics row every N steps")
     return p
 
 
@@ -709,6 +772,15 @@ def main(argv=None):
         # Initial loss.
         init = evaluate(model, eval_loader, device=device)
         print("[train] smoke init loss=%.4f ppl=%.2f" % (init["loss"], init["ppl"]))
+        tracker = _new_tracker(args, {
+            "mode": "smoke", "steps": steps, "seq_len": seq_len,
+            "batch_size": batch_size, "lr": lr, "d_model": d_model,
+            "n_enc": n_enc, "n_dec": n_dec, "nhead": nhead, "dim_ff": dim_ff,
+            "vocab_size": vocab_size, "init_loss": float(init["loss"]),
+        })
+        if tracker is not None and getattr(tracker, "active", False):
+            print("[track] run dir: %s" % tracker.dir)
+            tracker.log(0, {"loss": float(init["loss"]), "ppl": float(init["ppl"])})
         # Train: cycle the fixed loader until `steps` optimizer updates.
         # NOTE: no per-step batch .to(device) here -- batches are already CPU
         # and compute_loss moves only when needed, saving a dict alloc + 2x
@@ -726,6 +798,8 @@ def main(argv=None):
                 opt.step()
                 total += float(loss.item())
                 n += 1
+                if tracker is not None and getattr(tracker, "active", False) and n % 10 == 0:
+                    tracker.log(n, {"loss": float(loss.item())})
         final = evaluate(model, eval_loader, device=device)
         print("[train] smoke final loss=%.4f ppl=%.2f (avg step loss=%.4f)" % (final["loss"], final["ppl"], total / max(1, n)))
         if not (final["loss"] < init["loss"]):
@@ -764,6 +838,17 @@ def main(argv=None):
                 print("[train] saved ckpt to %s" % args.ckpt)
             except Exception as e:
                 print("[train] WARNING: ckpt save failed: %r" % (e,), file=sys.stderr)
+        try:
+            if tracker is not None and getattr(tracker, "active", False):
+                tracker.log(max(1, n), {"loss": float(final["loss"]),
+                                        "ppl": float(final["ppl"])})
+                tracker.close({"init_loss": float(init["loss"]),
+                               "final_loss": float(final["loss"]),
+                               "final_ppl": float(final["ppl"]),
+                               "avg_step_loss": total / max(1, n),
+                               "steps": n, "ckpt": args.ckpt})
+        except Exception:
+            pass
         return 0
 
     # ---- Non-smoke path ----------------------------------------------------
@@ -771,6 +856,10 @@ def main(argv=None):
     seq_len = max(2, int(args.seq_len))
     batch_size = max(1, int(args.batch_size))
     lr = float(args.lr)
+    try:
+        log_every = max(1, int(getattr(args, "log_every", 20) or 20))
+    except Exception:
+        log_every = 20
 
     if args.data == "tinystories":
         # Build tokenizer from a small corpus sample, then dataloader.
@@ -816,6 +905,15 @@ def main(argv=None):
     model = _make_model(config)
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    tracker = _new_tracker(args, {
+        "mode": "train", "data": args.data, "steps": steps, "seq_len": seq_len,
+        "batch_size": batch_size, "lr": lr, "max_examples": int(args.max_examples),
+        "d_model": d_model, "n_enc": int(args.n_enc), "n_dec": int(args.n_dec),
+        "nhead": nhead, "dim_ff": dim_ff, "vocab_size": vocab_size,
+        "log_every": log_every,
+    })
+    if getattr(tracker, "active", False):
+        print("[track] run dir: %s" % tracker.dir)
 
     # Cosine-ish decay (manual; constant also acceptable per spec).
     total, n = 0.0, 0
@@ -842,6 +940,12 @@ def main(argv=None):
             opt.step()
             total += float(loss.item())
             it += 1
+            if getattr(tracker, "active", False) and (it == 1 or it % log_every == 0):
+                try:
+                    _lr_log = float(opt.param_groups[0]["lr"])
+                except Exception:
+                    _lr_log = lr
+                tracker.log(it, {"loss": float(loss.item()), "lr": _lr_log})
             if it == 1 or it % 100 == 0:
                 try:
                     _lr_now = float(opt.param_groups[0]["lr"])
@@ -858,9 +962,11 @@ def main(argv=None):
             continue
         break
     print("[train] done steps=%d avg_loss=%.4f" % (it, total / max(1, it)))
+    ev_loss, ev_ppl = None, None
     try:
         ev = evaluate(model, loader, device=device, max_batches=20)
-        print("[train] eval loss=%.4f ppl=%.2f" % (ev["loss"], ev["ppl"]), flush=True)
+        ev_loss, ev_ppl = float(ev["loss"]), float(ev["ppl"])
+        print("[train] eval loss=%.4f ppl=%.2f" % (ev_loss, ev_ppl), flush=True)
     except Exception as e:
         print("[train] WARNING: eval failed: %r" % (e,))
     if args.ckpt:
@@ -877,6 +983,14 @@ def main(argv=None):
         except Exception as e:
             print("[train] WARNING: ckpt save failed: %r" % (e,), file=sys.stderr)
             return 1
+    try:
+        if getattr(tracker, "active", False):
+            tracker.log(max(1, it), {"loss": total / max(1, it)})
+            tracker.close({"steps": it, "avg_step_loss": total / max(1, it),
+                           "eval_loss": ev_loss, "eval_ppl": ev_ppl,
+                           "ckpt": args.ckpt})
+    except Exception:
+        pass
     return 0
 
 

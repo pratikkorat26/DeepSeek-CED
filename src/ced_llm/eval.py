@@ -89,6 +89,15 @@ except Exception:
         generate_greedy = _mod3.generate_greedy
         generate_story = _mod3.generate_story
 
+# -- tracking import (opt-in via --run-dir; never breaks eval when missing) --
+try:
+    from .tracking import RunTracker  # type: ignore
+except Exception:
+    try:
+        from src.ced_llm.tracking import RunTracker  # type: ignore
+    except Exception:
+        RunTracker = None
+
 # Three fixed eval prompts (mirrors the demo carnival, minus the glitter).
 EVAL_PROMPTS = [
     ("eval-1", "Once upon a time there was a brave little bunny", 7),
@@ -137,7 +146,28 @@ def build_argparser():
                    help="tokens per generation sample")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--run-dir", type=str, default=None,
+                   help="track this eval: write config/metrics/summary under RUN_DIR/<name>")
+    p.add_argument("--run-name", type=str, default=None,
+                   help="run subdir name (default: run-YYYYMMDD-HHMMSS)")
+    p.add_argument("--tensorboard", action="store_true",
+                   help="mirror scalars to TensorBoard (needs pip install tensorboard)")
     return p
+
+
+def _maybe_tracker(args, config):
+    """Build a RunTracker when --run-dir is given, else None (never raises)."""
+    try:
+        if not getattr(args, "run_dir", None) or RunTracker is None:
+            return None
+        t = RunTracker(run_dir=args.run_dir, run_name=getattr(args, "run_name", None),
+                       config=config, tensorboard=bool(getattr(args, "tensorboard", False)))
+        if getattr(t, "active", False):
+            print("[track] run dir: %s" % t.dir)
+            return t
+        return None
+    except Exception:
+        return None
 
 
 def _resolve_model_and_tokenizer(args, device):
@@ -240,6 +270,14 @@ def main(argv=None):
         assert len(res["samples"]) == 3, "smoke must produce 3 samples"
         print("[eval] SMOKE OK (loss=%.4f ppl=%.2f samples=3)" % (
             res["loss"], res["ppl"]))
+        try:
+            t = _maybe_tracker(args, {"mode": "eval-smoke", "seed": int(args.seed)})
+            if t is not None:
+                t.log(0, {"loss": float(res["loss"]), "ppl": float(res["ppl"])})
+                t.close({"loss": float(res["loss"]), "ppl": float(res["ppl"]),
+                         "samples": len(res["samples"])})
+        except Exception:
+            pass
         return 0
 
     # ---- Non-smoke ------------------------------------------------------
@@ -251,6 +289,18 @@ def main(argv=None):
                    delightful=True)
     print("[eval] DONE loss=%.4f ppl=%.2f samples=%d (source=%s data=%s)" % (
         res["loss"], res["ppl"], len(res["samples"]), source, args.data))
+    try:
+        t = _maybe_tracker(args, {"mode": "eval", "source": source, "data": args.data,
+                                  "ckpt": args.ckpt, "seq_len": int(args.seq_len),
+                                  "max_examples": int(args.max_examples),
+                                  "max_new": int(args.max_new),
+                                  "seed": int(args.seed)})
+        if t is not None:
+            t.log(0, {"loss": float(res["loss"]), "ppl": float(res["ppl"])})
+            t.close({"loss": float(res["loss"]), "ppl": float(res["ppl"]),
+                     "samples": len(res["samples"]), "source": source})
+    except Exception:
+        pass
     return 0
 
 

@@ -6,7 +6,7 @@
 # --- Core (REQUIRED) ---
 # torch: model + train + generate (SDPA attention needs torch>=2.0).
 torch>=2.0
-# pytest: test runner (pytest -q must stay 22/22 green).
+# pytest: test runner (pytest -q must stay 28/28 green).
 pytest
 
 # --- Optional (FALLBACK-COVERED: safe to skip; repo works fully offline without them) ---
@@ -15,3 +15,6 @@ pytest
 datasets
 # tiktoken: GPT-2 encoding probe only; SimpleTokenizer (offline word-level) used otherwise.
 tiktoken
+# tensorboard: `train --tensorboard` / TensorBoard mirroring of run metrics.
+#   Missing package only warns; JSONL logs in runs/ always work.
+tensorboard

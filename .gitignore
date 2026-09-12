@@ -23,6 +23,9 @@ checkpoints/
 *.bin
 *.safetensors
 
+# Tracked runs (training/eval metrics; local only, compare offline)
+runs/
+
 # Ship-crew internal docs (do not publish)
 THUNDERDOME_*.md
 SHIP_*.md
