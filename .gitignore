@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.Python
+
+# Test / cache
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Checkpoints / weights
+checkpoints/
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# Ship-crew internal docs (do not publish)
+THUNDERDOME_*.md
+SHIP_*.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

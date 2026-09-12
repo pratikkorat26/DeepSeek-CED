@@ -1,0 +1,17 @@
+# DeepSeek-CER dependencies — offline-first, CPU-friendly.
+# Install: pip install -r requirements.txt
+# Smoke:   pytest -q && python3 -m src.ced_llm.train --smoke && python3 -m src.ced_llm.generate --smoke
+# See README.md (Quickstart) + CONTRIBUTING.md (no new REQUIRED deps without fallback).
+
+# --- Core (REQUIRED) ---
+# torch: model + train + generate (SDPA attention needs torch>=2.0).
+torch>=2.0
+# pytest: test runner (pytest -q must stay 22/22 green).
+pytest
+
+# --- Optional (FALLBACK-COVERED: safe to skip; repo works fully offline without them) ---
+# datasets: real TinyStories via HF; synthetic fallback if missing/offline.
+#   Proven by test_tinystories_loader_fallback_offline (imports force-broken, still green).
+datasets
+# tiktoken: GPT-2 encoding probe only; SimpleTokenizer (offline word-level) used otherwise.
+tiktoken
