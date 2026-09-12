@@ -86,6 +86,32 @@ except Exception:
             return []
 
 
+# -- optimizer import (same layout tolerance; AdamW fallback keeps smoke alive) --
+try:
+    from .optim import build_optimizer  # type: ignore
+except Exception:
+    try:
+        from src.ced_llm.optim import build_optimizer  # type: ignore
+    except Exception:
+        build_optimizer = None
+
+
+def _new_optimizer(args, model, lr):
+    """Build the CLI-selected optimizer (AdamW default; Muon optional)."""
+    try:
+        if build_optimizer is not None:
+            return build_optimizer(
+                getattr(args, "optimizer", "adamw"),
+                model.parameters(),
+                lr=float(lr),
+                muon_lr=float(getattr(args, "muon_lr", 0.02)),
+                momentum=float(getattr(args, "muon_momentum", 0.95)),
+            )
+    except Exception:
+        pass
+    return torch.optim.AdamW(model.parameters(), lr=float(lr))
+
+
 def _new_tracker(args, extra_config):
     """Build a RunTracker from CLI args (disabled with --no-track)."""
     try:
@@ -747,6 +773,13 @@ def build_argparser():
                    help="mirror scalars to TensorBoard (needs pip install tensorboard)")
     p.add_argument("--log-every", type=int, default=20,
                    help="log a metrics row every N steps")
+    p.add_argument("--optimizer", type=str, default="adamw",
+                   choices=["adamw", "muon"],
+                   help="adamw = AdamW everywhere; muon = Muon for matrices + AdamW for rest")
+    p.add_argument("--muon-lr", type=float, default=0.02,
+                   help="Muon learning rate for 2D params (Muon scale, not AdamW scale)")
+    p.add_argument("--muon-momentum", type=float, default=0.95,
+                   help="Muon momentum coefficient")
     return p
 
 
@@ -768,7 +801,7 @@ def main(argv=None):
         config = _make_config(vocab_size, d_model, n_enc, n_dec, nhead, dim_ff, seq_len, 0.0, 0)
         model = _make_model(config)
         model.to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=lr)
+        opt = _new_optimizer(args, model, lr)
         # Initial loss.
         init = evaluate(model, eval_loader, device=device)
         print("[train] smoke init loss=%.4f ppl=%.2f" % (init["loss"], init["ppl"]))
@@ -777,6 +810,8 @@ def main(argv=None):
             "batch_size": batch_size, "lr": lr, "d_model": d_model,
             "n_enc": n_enc, "n_dec": n_dec, "nhead": nhead, "dim_ff": dim_ff,
             "vocab_size": vocab_size, "init_loss": float(init["loss"]),
+            "optimizer": str(getattr(args, "optimizer", "adamw")),
+            "muon_lr": float(getattr(args, "muon_lr", 0.02)),
         })
         if tracker is not None and getattr(tracker, "active", False):
             print("[track] run dir: %s" % tracker.dir)
@@ -806,7 +841,7 @@ def main(argv=None):
             # Retry once with more steps/higher LR before failing (deterministic).
             print("[train] WARNING: loss did not decrease; retrying with lr*3 ...")
             for batch in loader:
-                opt2 = torch.optim.AdamW(model.parameters(), lr=lr * 3)
+                opt2 = _new_optimizer(args, model, lr * 3)
                 for _ in range(20):
                     opt2.zero_grad(set_to_none=True)
                     l, _ = compute_loss(model, batch)
@@ -904,13 +939,15 @@ def main(argv=None):
     )
     model = _make_model(config)
     model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    opt = _new_optimizer(args, model, lr)
     tracker = _new_tracker(args, {
         "mode": "train", "data": args.data, "steps": steps, "seq_len": seq_len,
         "batch_size": batch_size, "lr": lr, "max_examples": int(args.max_examples),
         "d_model": d_model, "n_enc": int(args.n_enc), "n_dec": int(args.n_dec),
         "nhead": nhead, "dim_ff": dim_ff, "vocab_size": vocab_size,
         "log_every": log_every,
+        "optimizer": str(getattr(args, "optimizer", "adamw")),
+        "muon_lr": float(getattr(args, "muon_lr", 0.02)),
     })
     if getattr(tracker, "active", False):
         print("[track] run dir: %s" % tracker.dir)

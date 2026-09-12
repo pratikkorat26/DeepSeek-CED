@@ -25,7 +25,7 @@ buy GPUs. (Turbo tried. Chaos cast spells. Docs won anyway.)
 pip install -r requirements.txt
 # torch>=2.0 and pytest are required; datasets/tiktoken are optional (fallback-covered)
 
-pytest -q                                        # 22 tests, ~2s, all green or riot
+pytest -q                                        # 35 tests, ~2s, all green or riot
 python3 -m src.ced_llm.train --smoke             # toy run: asserts loss goes DOWN
 python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encoder runs x1
 ```
@@ -33,7 +33,7 @@ python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encode
 Expected smoke output (don't panic if numbers wiggle slightly by torch version):
 
 ```
-22 passed in ~1.4s
+ 35 passed in ~2.2s
 [train] SMOKE OK (loss 6.25 -> 4.83, the line goes down, stonks 📉📈)
 [generate] SMOKE OK (tokens=... encoder_forwards=1, the encoder took ONE nap... er, pass)
 ```
@@ -55,6 +55,22 @@ python3 -m src.ced_llm.generate --ckpt ckpt.pt --prompt "The little bunny" \
 # Carnival mode (3 seeded stories + quality scores, if demo_stories.py exists):
 python3 demo_stories.py --smoke
 ```
+
+### Optimizer (AdamW vs Muon)
+
+Default is **AdamW** (`--lr 3e-4` + cosine decay, grad clip 1.0). Feeling
+dangerous? **Muon** orthogonalizes matrix gradients via Newton-Schulz and
+usually reaches lower loss in fewer steps:
+
+```bash
+python3 -m src.ced_llm.train --data tinystories --steps 500 --ckpt ckpt.pt \
+  --optimizer muon --muon-lr 0.02
+```
+
+Convention: 2D params (matrices) → Muon at `--muon-lr` (Muon scale, ~0.02);
+biases/norms → AdamW at `--lr`. Zero new dependencies — `src/ced_llm/optim.py`
+is a self-contained reimplementation. The optimizer choice is recorded in
+every run's `config.json`, so comparisons stay honest.
 
 ---
 
@@ -215,6 +231,7 @@ src/ced_llm/decoder.py    # CausalDecoder: self-attn + global cross-attn + FFN, 
 src/ced_llm/model.py      # CEDForLM: embed ONCE, encode_once, init_decode_cache, forward_step
 src/ced_llm/data.py       # SimpleTokenizer, TinyStories loader + synthetic fallback, encode_pack
 src/ced_llm/train.py      # compute_loss / train_one_epoch / evaluate / CLI (--smoke toy run, --run-dir tracking)
+src/ced_llm/optim.py      # Muon (Newton-Schulz) + AdamW hybrid factory, torch-only, zero new deps
 src/ced_llm/tracking.py   # RunTracker: offline JSONL runs + optional TensorBoard mirror
 src/ced_llm/eval.py       # perplexity + 3 samples CLI (--smoke, --ckpt, --run-dir)
 src/ced_llm/generate.py   # generate_greedy (cache-once + step loop) / sampling spells / CLI
@@ -225,6 +242,7 @@ tests/test_kv_reuse.py    # Full-vs-incremental parity, ptr stability, global de
 tests/test_training.py    # Toy overfit, grad flow to encoder, padding invariance
 tests/test_edgecases_docs.py  # DOC-BOSS: empty prompt, single token, truncation, temp=0 (7 tests)
 tests/test_tracking.py      # RunTracker layout, disabled mode, TB fallback, smoke end-to-end
+tests/test_optim.py         # Newton-Schulz band, Muon descent, hybrid routing, muon smoke
 ARCHITECTURE.md           # Deep dive: encoder-once + KV-reuse with ASCII traces
 CONTRIBUTING.md           # How to contribute without summoning demons
 requirements.txt          # torch+pytest required; datasets/tiktoken optional (commented)
