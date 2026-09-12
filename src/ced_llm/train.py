@@ -913,10 +913,37 @@ def _fixed_toy_loader(vocab_size, seq_len, batch_size, num_batches=8, seed=0):
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Presets: battle-tested configs (explicit flags always win over presets)
 # ---------------------------------------------------------------------------
-def build_argparser():
+PRESETS = {
+    # 14.6M params (GPT-2 tok) / 3.8M (simple tok), ~59 MB fp32, ~3 min MPS.
+    # Depth over width: 4+4 layers learn narrative flow better than 2+2 wide.
+    "tinystories-small": dict(
+        data="tinystories", tokenizer="simple",
+        d_model=128, n_enc=4, n_dec=4, nhead=4,
+        seq_len=128, batch_size=16, steps=3000, lr=3e-4,
+        # 5000 examples ≈ 300+ batches/epoch: the finite-loader guard caps
+        # re-cycling at ~11 passes, so this is what makes 3000 steps reachable.
+        max_examples=5000,
+    ),
+}
+
+
+def build_argparser(preset=None):
     p = argparse.ArgumentParser(description="Train minimal dense CED LM")
+    try:
+        defaults = dict(PRESETS.get(str(preset or ""), {}))
+    except Exception:
+        defaults = {}
+
+    def _d(name, fallback):
+        try:
+            return defaults.get(name, fallback)
+        except Exception:
+            return fallback
+
+    p.add_argument("--preset", type=str, default=None,
+                   help="named config (tinystories-small); explicit flags win")
     p.add_argument("--smoke", action="store_true", help="offline smoke: tiny toy run")
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--seq-len", type=int, default=128)
@@ -988,11 +1015,28 @@ def build_argparser():
                    help="prefetch per worker (only when --num-workers>0)")
     p.add_argument("--pin-memory", action="store_true",
                    help="DataLoader pin_memory (opt-in)")
+    # Preset defaults go last so explicit CLI flags always win.
+    try:
+        _map = {"data": "data", "tokenizer": "tokenizer", "d_model": "d_model",
+                "n_enc": "n_enc", "n_dec": "n_dec", "nhead": "nhead",
+                "seq_len": "seq_len", "batch_size": "batch_size",
+                "steps": "steps", "lr": "lr", "max_examples": "max_examples"}
+        p.set_defaults(**{d: defaults[k] for k, d in _map.items() if k in defaults})
+    except Exception:
+        pass
     return p
 
 
 def main(argv=None):
-    args = build_argparser().parse_args(argv)
+    # Preset pre-scan so --preset can shift parser defaults (explicit wins).
+    try:
+        _pre = argparse.ArgumentParser(add_help=False)
+        _pre.add_argument("--preset", default=None)
+        _known, _ = _pre.parse_known_args(argv)
+        _preset = _known.preset
+    except Exception:
+        _preset = None
+    args = build_argparser(_preset).parse_args(argv)
     set_seed(args.seed)
     device = _resolve_device(getattr(args, "device", "cpu"))
     try:

@@ -56,6 +56,26 @@ python3 -m src.ced_llm.generate --ckpt ckpt.pt --prompt "The little bunny" \
 python3 demo_stories.py --smoke
 ```
 
+### The sensible model: `--preset tinystories-small`
+
+Depth over width: **d128, 4+4 layers, seq 128, batch 16, 3000 steps** =
+3.8M params (simple tok) / 14.6M (GPT-2 tok), ~59 MB fp32. Measured on
+Apple M4 MPS, ~6 min wall, synthetic fallback data (offline):
+
+```bash
+python3 -m src.ced_llm.train --preset tinystories-small \
+  --ckpt checkpoints/tinysmall.pt --device mps --seed 0
+# [train] done steps=3000 avg_loss=2.60 | eval loss=1.21 ppl=3.34
+python3 -m src.ced_llm.generate --ckpt checkpoints/tinysmall.pt \
+  --prompt "Once upon a time there was a little bunny" --max-new 60
+# "once upon a time there was a little bunny and were exploring ... hugged hugged said hugged keep"
+```
+
+Story-shaped, narrative rhythm intact — with `<unk>` confetti betraying the
+word-level tokenizer (see Tokenizer section for the GPT-2 fix). Explicit
+flags always override the preset; `max_examples=5000` is what makes 3000
+steps reachable under the finite-loader guard.
+
 ### Optimizer (AdamW vs Muon)
 
 Default is **AdamW** (`--lr 3e-4` + cosine decay, grad clip 1.0). Feeling
