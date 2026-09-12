@@ -124,26 +124,66 @@ class ComboOptimizer:
             o.load_state_dict(s)
 
 
+def _maybe_adamw(params, lr, foreach=None, fused=None):
+    """AdamW with optional foreach/fused fast paths (MPS-safe fallback).
+
+    Default (foreach=None, fused=None) matches the historical
+    ``torch.optim.AdamW(params, lr=lr)`` exactly. When a fast path is
+    requested but the device/build rejects it, fall back to vanilla AdamW
+    (never raises for this reason).
+    """
+    kw = {}
+    if foreach is not None:
+        kw["foreach"] = bool(foreach)
+    if fused is not None:
+        kw["fused"] = bool(fused)
+    if not kw:
+        return torch.optim.AdamW(params, lr=float(lr))
+    try:
+        return torch.optim.AdamW(params, lr=float(lr), **kw)
+    except Exception:
+        # e.g. fused kernels unavailable on this device/build.
+        try:
+            if "fused" in kw:
+                kw2 = {k: v for k, v in kw.items() if k != "fused"}
+                return torch.optim.AdamW(params, lr=float(lr), **kw2)
+        except Exception:
+            pass
+        return torch.optim.AdamW(params, lr=float(lr))
+
+
 def build_optimizer(name, parameters, lr=3e-4, muon_lr=0.02, momentum=0.95,
-                    weight_decay=0.0):
+                     weight_decay=0.0, foreach=None, fused=None, ns_steps=5):
     """Factory: 'adamw' -> AdamW (all params); 'muon' -> Muon (2D) + AdamW (rest).
 
     The AdamW branch matches the historical default exactly
-    (``torch.optim.AdamW(params, lr=lr)``). Unknown names raise ValueError.
+    (``torch.optim.AdamW(params, lr=lr)``) when foreach/fused are None.
+    Pass foreach=True and/or fused=True to opt into the lower-overhead
+    AdamW kernels (measured ~+20% train tok/s on MPS smoke shapes,
+    ~+2% on real shapes; capturable intentionally unsupported on MPS).
+    ns_steps controls Muon Newton-Schulz iterations (default 5, identical);
+    fewer steps (e.g. 3) shave ~0.3ms/matmul-call but change update numerics,
+    so only use via explicit flag. Unknown names raise ValueError.
     """
     key = str(name or "adamw").lower()
     params = [p for p in parameters if getattr(p, "requires_grad", True)]
+    try:
+        ns_steps = int(ns_steps)
+    except Exception:
+        ns_steps = 5
     if key == "adamw":
-        return torch.optim.AdamW(params, lr=float(lr))
+        return _maybe_adamw(params, float(lr), foreach=foreach, fused=fused)
     if key == "muon":
         mat = [p for p in params if getattr(p, "ndim", 0) == 2]
         rest = [p for p in params if getattr(p, "ndim", 0) != 2]
         opts = []
         if mat:
             opts.append(Muon(mat, lr=float(muon_lr), momentum=float(momentum),
-                             weight_decay=float(weight_decay)))
+                             weight_decay=float(weight_decay),
+                             ns_steps=ns_steps))
         if rest:
-            opts.append(torch.optim.AdamW(rest, lr=float(lr)))
+            opts.append(_maybe_adamw(rest, float(lr),
+                                     foreach=foreach, fused=fused))
         if len(opts) == 1:
             return opts[0]
         return ComboOptimizer(opts)

@@ -130,24 +130,34 @@ changes with fixed globals. See `tests/test_causality.py`.
 
 ## 📊 Benchmarks
 
-> DOC-BOSS decree: no vanity numbers without repro commands. Fill this in on
-> YOUR machine and open a PR — future you will thank past you.
+Measured on Apple M4, torch 2.14, `benchmarks/speed.py` (tok/s, best of runs;
+MPS tiny-shape timing is noisy ±15–30%, CPU is stable):
 
-| Workload (CPU) | Command | Time / metric | Notes |
-|---|---|---|---|
-| Full test suite (22 tests) | `pytest -q` | `___s` (ref: ~1.4s) | Must be 22/22 green |
-| Train smoke (60 toy steps) | `python3 -m src.ced_llm.train --smoke` | `___s` (ref: ~1.2s), loss `6.25 → 4.83` | Asserts final < initial |
-| Generate smoke (16 tokens) | `python3 -m src.ced_llm.generate --smoke` | `___s` (ref: ~0.6s), `encoder_forwards=1` | Proves KV-reuse |
-| `model.forward` avg (d_model=128, 2+2, B=8, T=128, 30 iters) | see `ARCHITECTURE.md` § Perf | `___ ms` | Your silicon here |
-| `forward_step` incremental avg (50 iters) | see `ARCHITECTURE.md` § Perf | `___ ms` | Should be ≪ full forward |
-| TinyStories train (2000 ex, 500 steps) | command in Quickstart | loss `___ → ___` | Optional, offline-safe |
+| Workload | Command | Apple M4 result |
+|---|---|---|
+| Full test suite (35 tests) | `pytest -q` | ~2.1s, 35/35 green |
+| Train smoke (60 toy steps) | `python3 -m src.ced_llm.train --smoke` | loss `6.25 → 4.83`, asserts final < initial |
+| Generate smoke (16 tokens) | `python3 -m src.ced_llm.generate --smoke` | `encoder_forwards=1`, proves KV-reuse |
+| Train, MPS (d=128, 2+2, B=8, T=128) | `benchmarks/speed.py --device mps` | **~89k tok/s** (11.4 ms/step) |
+| Train, CPU (same shape) | `benchmarks/speed.py --device cpu` | ~61k tok/s (16.6 ms/step) |
+| Generate, MPS (same shape) | `benchmarks/speed.py --device mps` | **~470 tok/s** (2.1 ms/token) |
+| Generate, MPS batched ×8 | `benchmarks/speed.py --device mps --gen-loop forge --gen-batch-size 8` | **~4000 tok/s** (~8.5× single) |
+| Generate, CPU (same shape) | `benchmarks/speed.py --device cpu` | ~4700 tok/s (0.21 ms/token) |
+| Train smoke, MPS stacked flags | `train --smoke --device mps --fused --grad-clip 0 --loss-sync-every 8` | wall 1.81s → **1.51s (+20%)** |
 
-**How to fill the table honestly:**
+Speed levers (all opt-in except the freebies): fused QKV + static KV cache +
+mask fast paths (inference, exact parity), `--fused`/`--foreach` AdamW,
+`--grad-clip 0`, `--loss-sync-every 8`, `--device mps`, batch decode.
+Defaults (CPU fp32) are bit-identical: smoke canary `6.2551 → 4.8283` before
+and after. Raw JSON: `benchmarks/baseline_*` (pre-tune) vs `benchmarks/tuned_*`.
+
+**Reproduce on your machine:**
 
 ```bash
 pytest -q
 time python3 -m src.ced_llm.train --smoke
 time python3 -m src.ced_llm.generate --smoke
+python3 benchmarks/speed.py --device auto
 ```
 
 ---
@@ -235,6 +245,7 @@ src/ced_llm/optim.py      # Muon (Newton-Schulz) + AdamW hybrid factory, torch-o
 src/ced_llm/tracking.py   # RunTracker: offline JSONL runs + optional TensorBoard mirror
 src/ced_llm/eval.py       # perplexity + 3 samples CLI (--smoke, --ckpt, --run-dir)
 src/ced_llm/generate.py   # generate_greedy (cache-once + step loop) / sampling spells / CLI
+benchmarks/speed.py       # tok/s harness: train+gen on cpu/mps, fp32/fp16, batch decode
 tests/test_causality.py   # Encoder + decoder self-attn causality proofs
 tests/test_data.py        # Tokenizer round-trip, pack, batch shapes, offline fallback
 tests/test_generate.py    # Greedy determinism, KV-reuse counter, length-or-EOS-stop

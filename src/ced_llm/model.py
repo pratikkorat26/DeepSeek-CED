@@ -31,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import CEDConfig
+from .config import CEDConfig, resolve_dtype
 from .decoder import CausalDecoder, KVCache
 from .encoder import CausalEncoder
 
@@ -43,6 +43,11 @@ class CEDForLM(nn.Module):
         super().__init__()
         config.validate()
         self.config = config
+        # Dtype policy: default fp32 (bit-identical). Validates flag early.
+        try:
+            self._resolved_dtype = resolve_dtype("cpu", getattr(config, "dtype", "fp32"))
+        except Exception:
+            self._resolved_dtype = None
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
         self.encoder = CausalEncoder(config)
@@ -55,6 +60,10 @@ class CEDForLM(nn.Module):
         # Cache of position-row tensors keyed by (T, device-str) to avoid
         # re-allocating torch.arange on every _embed call.
         self._pos_cache: dict = {}
+        # Cache of converted pad masks keyed by id(tensor) -> (ref, result).
+        # Fixed toy loaders reuse the same mask objects, so hits avoid a
+        # per-forward ``==0`` alloc + ``.any()`` device sync.
+        self._pad_cache: dict = {}
         self.apply(self._init_weights)
 
     @staticmethod
@@ -132,6 +141,37 @@ class CEDForLM(nn.Module):
             except Exception:
                 return None
 
+    def _pad_mask_cached(self, attention_mask: Optional[Tensor]) -> Optional[Tensor]:
+        """Cached ``_pad_mask`` for reused mask objects (no per-forward sync).
+
+        Keys by ``id(tensor)`` holding a strong ref to prevent ABA reuse.
+        Bit-identical: returns the same ``None``-vs-bool semantics as
+        :meth:`_pad_mask`; converted bool tensors are read-only and shared.
+        """
+        if attention_mask is None:
+            return None
+        try:
+            key = id(attention_mask)
+            hit = self._pad_cache.get(key)
+            if hit is not None:
+                ref, res = hit
+                if ref is attention_mask:
+                    return res
+            res = self._pad_mask(attention_mask)
+            try:
+                if len(self._pad_cache) >= 32:
+                    # Evict oldest (dict preserves insertion order).
+                    try:
+                        self._pad_cache.pop(next(iter(self._pad_cache)))
+                    except Exception:
+                        self._pad_cache.clear()
+                self._pad_cache[key] = (attention_mask, res)
+            except Exception:
+                pass
+            return res
+        except Exception:
+            return self._pad_mask(attention_mask)
+
     def _encode_embedded(
         self, x_emb: Tensor, key_padding_mask: Optional[Tensor]
     ) -> Tensor:
@@ -153,7 +193,9 @@ class CEDForLM(nn.Module):
             ``k_glob`` and ``v_glob`` (shared global KV ``[B, T, D]``).
             Increments :attr:`encoder_forward_count` by exactly 1.
         """
-        h_enc = self._encode_embedded(self._embed(input_ids), self._pad_mask(attention_mask))
+        h_enc = self._encode_embedded(
+            self._embed(input_ids), self._pad_mask_cached(attention_mask)
+        )
         return {
             "h_enc": h_enc,
             "k_glob": self.kv_proj_k(h_enc),
@@ -181,7 +223,7 @@ class CEDForLM(nn.Module):
         Returns:
             ``{"logits": [B, T, V], "loss": scalar or None}``.
         """
-        pad_mask = self._pad_mask(attention_mask)
+        pad_mask = self._pad_mask_cached(attention_mask)
         # Single shared embedding: encoder and decoder read identical
         # token+pos vectors, so compute once instead of twice.
         x_emb = self._embed(input_ids)
@@ -226,6 +268,27 @@ class CEDForLM(nn.Module):
         self.encoder_forward_count = 0
         enc = self.encode_once(input_ids, attention_mask)
         n_layers = len(self.decoder.layers)
+        # Hoisted decode invariants: glob mask computed once (no per-step
+        # ``_pad_mask`` alloc+sync), batch + reusable pos buffer, static KV
+        # buffers (lazy-allocated on first step to match exact dtype/device).
+        try:
+            glob_mask = self._pad_mask_cached(attention_mask)
+        except Exception:
+            glob_mask = None
+        try:
+            _b = int(input_ids.size(0))
+        except Exception:
+            _b = 1
+        try:
+            _pos_buf = torch.empty(
+                _b, 1, dtype=torch.long, device=input_ids.device
+            ).fill_(0)
+        except Exception:
+            _pos_buf = None
+        try:
+            _use_static = bool(getattr(self.config, "use_static_cache", True))
+        except Exception:
+            _use_static = True
         return {
             "k_glob": enc["k_glob"],
             "v_glob": enc["v_glob"],
@@ -234,6 +297,15 @@ class CEDForLM(nn.Module):
             "enc_ids": input_ids,
             "enc_mask": attention_mask,
             "T_enc": input_ids.size(1),
+            # --- FORGE-MODEL static-decode state (backward-compat extras) ---
+            "self_k_buf": [None] * n_layers,
+            "self_v_buf": [None] * n_layers,
+            "self_decode_len": 0,
+            "self_static_capacity": int(self.config.max_seq_len),
+            "glob_mask": glob_mask,
+            "batch": _b,
+            "_pos_buf": _pos_buf,
+            "use_static": _use_static,
         }
 
     def forward_step(
@@ -261,6 +333,7 @@ class CEDForLM(nn.Module):
         Returns:
             ``(logits [B, 1, V], cache)`` with ``cache`` the same (mutated) dict.
         """
+        # --- Hoisted per-token validation (cheap int compares, no sync) ---
         if next_ids.dim() != 2 or next_ids.size(1) != 1:
             raise ValueError(
                 "next_ids must have shape [B, 1], got %s" % (tuple(next_ids.shape),)
@@ -270,20 +343,137 @@ class CEDForLM(nn.Module):
         batch = next_ids.size(0)
         if k_glob.size(0) != batch or v_glob.size(0) != batch:
             raise ValueError("batch size of next_ids and cache must match")
-        self_k_list: List[KVCache] = cache["self_k_list"]
-        self_v_list: List[KVCache] = cache["self_v_list"]
-        first_k = self_k_list[0]
-        cur_len = 0 if first_k is None else first_k.size(2)
-        if cur_len + 1 > self.config.max_seq_len:
+        # Hoist config attr + decode length (cached int, no tensor size op).
+        max_len = self.config.max_seq_len
+        try:
+            _dl = cache.get("self_decode_len", None)
+        except Exception:
+            _dl = None
+        if _dl is None:
+            # Backward compat: old caches without static length counter.
+            try:
+                self_k_list_old: List[KVCache] = cache["self_k_list"]
+                first_k = self_k_list_old[0] if len(self_k_list_old) else None
+            except Exception:
+                first_k = None
+            cur_len = 0 if first_k is None else int(first_k.size(2))
+        else:
+            try:
+                cur_len = int(_dl)
+            except Exception:
+                cur_len = 0
+        if cur_len + 1 > max_len:
             raise ValueError("decode position exceeds max_seq_len")
-        pos = torch.tensor([[cur_len]], device=next_ids.device).expand(batch, 1)
-        h = self.tok_emb(next_ids) + self.pos_emb(pos)
+        # --- Reusable pos buffer (no per-step torch.tensor alloc) ---
+        try:
+            pos_buf = cache.get("_pos_buf", None)
+        except Exception:
+            pos_buf = None
+        if (
+            pos_buf is not None
+            and getattr(pos_buf, "shape", None) is not None
+            and tuple(pos_buf.shape) == (batch, 1)
+            and getattr(pos_buf, "device", None) == next_ids.device
+        ):
+            try:
+                pos_buf.fill_(int(cur_len))
+                pos = pos_buf
+            except Exception:
+                pos = torch.tensor([[cur_len]], device=next_ids.device).expand(
+                    batch, 1
+                )
+        else:
+            try:
+                fresh_pos = torch.empty(
+                    batch, 1, dtype=torch.long, device=next_ids.device
+                ).fill_(int(cur_len))
+                try:
+                    cache["_pos_buf"] = fresh_pos
+                except Exception:
+                    pass
+                pos = fresh_pos
+            except Exception:
+                pos = torch.tensor([[cur_len]], device=next_ids.device).expand(
+                    batch, 1
+                )
+        # Local embedding refs (avoid repeated attribute dispatch).
+        tok_emb = self.tok_emb
+        pos_emb = self.pos_emb
+        h = tok_emb(next_ids) + pos_emb(pos)
 
         history_key_mask: Optional[Tensor] = None
         if attention_mask is not None and attention_mask.size(1) == cur_len + 1:
             history_key_mask = attention_mask == 0
-        glob_mask = self._pad_mask(cache.get("enc_mask"))
+        # Hoisted glob mask (computed once at init, no per-step sync).
+        try:
+            _gm_sentinel = object()
+            glob_mask = cache.get("glob_mask", _gm_sentinel)
+            if glob_mask is _gm_sentinel:
+                glob_mask = self._pad_mask_cached(cache.get("enc_mask"))
+                try:
+                    cache["glob_mask"] = glob_mask
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                glob_mask = self._pad_mask_cached(cache.get("enc_mask"))
+            except Exception:
+                glob_mask = None
 
+        # --- STATIC preallocated KV path (fill-in-place, default) ---
+        try:
+            use_static = bool(
+                cache.get(
+                    "use_static",
+                    bool(getattr(self.config, "use_static_cache", True)),
+                )
+            )
+        except Exception:
+            use_static = True
+        has_static_bufs = False
+        try:
+            has_static_bufs = (
+                "self_k_buf" in cache
+                and "self_v_buf" in cache
+                and "self_decode_len" in cache
+            )
+        except Exception:
+            has_static_bufs = False
+        if use_static and has_static_bufs:
+            try:
+                k_bufs = cache["self_k_buf"]
+                v_bufs = cache["self_v_buf"]
+                try:
+                    capacity = int(
+                        cache.get("self_static_capacity", max_len)
+                    )
+                except Exception:
+                    capacity = int(max_len)
+                if cur_len + 1 > capacity:
+                    raise ValueError("decode position exceeds max_seq_len")
+                dec_out, new_k_views, new_v_views = self.decoder.forward_static(
+                    h, k_glob, v_glob, history_key_mask, glob_mask,
+                    k_bufs, v_bufs, int(cur_len), int(capacity),
+                )
+                # Compat views (share buffer storage, no copy) + length bump.
+                try:
+                    cache["self_k_list"] = new_k_views
+                    cache["self_v_list"] = new_v_views
+                    cache["self_decode_len"] = int(cur_len) + 1
+                except Exception:
+                    pass
+                logits = self.lm_head(self.norm(dec_out))
+                return logits, cache
+            except ValueError:
+                raise
+            except Exception:
+                # Fall through to cat path on unexpected static failure
+                # (preserves correctness; static bugs never break parity).
+                pass
+
+        # --- Legacy cat path (old caches or use_static=False) ---
+        self_k_list: List[KVCache] = cache["self_k_list"]
+        self_v_list: List[KVCache] = cache["self_v_list"]
         layer_caches: List[KVCache] = []
         for k, v in zip(self_k_list, self_v_list):
             # NOTE: an empty cache is the (None, None) tuple (step mode),
@@ -296,5 +486,10 @@ class CEDForLM(nn.Module):
         for i, new_kv in enumerate(new_caches):
             assert new_kv is not None
             self_k_list[i], self_v_list[i] = new_kv
+        try:
+            if "self_decode_len" in cache:
+                cache["self_decode_len"] = int(cur_len) + 1
+        except Exception:
+            pass
         logits = self.lm_head(self.norm(dec_out))
         return logits, cache

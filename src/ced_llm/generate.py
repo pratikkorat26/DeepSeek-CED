@@ -363,6 +363,371 @@ def _sample_next_token(logits_2d, temperature=0.0, top_k=0, top_p=1.0,
 
 
 @torch.no_grad()
+def _greedy_fast_loop(model, cache, prev, generated, max_new_tokens,
+                      stop_on_eos, eos_list, device):
+    """Fused greedy decode loop (FORGE-DECODE fast path).
+
+    Bit-identical to the legacy loop in :func:`generate_greedy` for pure
+    greedy decoding (temperature<=0, repetition_penalty==1.0) but with the
+    per-token overhead hoisted out:
+
+    * single device-side ``argmax`` over the last position per step --
+      no ``logits.float().cpu()`` full-vocab D2H copy per token;
+    * one reused ``[1, 1]`` device input buffer (``fill_``) instead of a
+      fresh ``torch.tensor([[nxt]])`` alloc + H2D per token;
+    * EOS ids hoisted to a ``frozenset`` (legacy rebuilt an int list per
+      token), no per-step sampler dispatch / ``_extract_step_logits``
+      dispatch after the first step;
+    * ``cache["enc_mask"]`` noned when the prompt has no pads (the caller
+      builds an all-ones mask), which skips the per-step ``_pad_mask``
+      alloc + ``.any()`` device sync inside ``forward_step``. Semantically
+      identical: ``_pad_mask`` maps all-ones to ``None`` anyway.
+
+    Returns the extended ``generated`` id list, or ``None`` when the model
+    uses a non-canonical ``forward_step`` return convention (caller must
+    rebuild the cache and run the legacy loop). A ``None`` bail happens
+    before any id is appended, so the caller's ``generated`` is untouched.
+    """
+    try:
+        want_eos = bool(stop_on_eos) and bool(eos_list)
+        eos_set = frozenset(int(e) for e in (eos_list or [])) if want_eos else frozenset()
+        check_eos = want_eos and len(eos_set) > 0
+    except Exception:
+        check_eos, eos_set = False, frozenset()
+    # Hoisted mask normalization (see docstring). Guarded: foreign dict
+    # caches without the key simply skip it.
+    try:
+        if isinstance(cache, dict) and cache.get("enc_mask") is not None:
+            cache["enc_mask"] = None
+    except Exception:
+        pass
+    # Hoisted input-token buffer (local prealloc: no FORGE_MODEL.md static
+    # cache exists, so generate.py owns a tiny [1,1] reuse buffer).
+    try:
+        step_in = torch.empty((1, 1), dtype=torch.long, device=device)
+        step_in.fill_(int(generated[-1]))
+    except Exception:
+        return None
+    mode = None  # 'tuple' | 'dict' | 'tensor', detected on the first step
+    use_kw = False
+    kw_probed = False
+    for _ in range(max_new_tokens):
+        if use_kw:
+            out = model.forward_step(step_in, cache=cache)
+        else:
+            try:
+                out = model.forward_step(step_in, cache)
+            except TypeError:
+                if kw_probed:
+                    raise
+                use_kw = True
+                try:
+                    out = model.forward_step(step_in, cache=cache)
+                except Exception as e:
+                    raise RuntimeError("forward_step failed: %r" % (e,)) from e
+        kw_probed = True
+        if mode is None:
+            # One-time return-convention + shape probe (contract:
+            # logits [B,1,V], B==1 here). Anything exotic bails to legacy.
+            if isinstance(out, torch.Tensor):
+                mode = "tensor"
+                logits, new_cache = out, None
+            elif isinstance(out, dict):
+                lg = out.get("logits", None)
+                if not isinstance(lg, torch.Tensor):
+                    return None
+                if ("past" in out or "cache_out" in out) and "cache" not in out:
+                    return None
+                mode = "dict"
+                logits, new_cache = lg, out.get("cache")
+            elif isinstance(out, (tuple, list)) and len(out) == 2:
+                logits, new_cache = out[0], out[1]
+                if not isinstance(logits, torch.Tensor):
+                    return None
+                mode = "tuple"
+            else:
+                return None
+            if logits.dim() == 3:
+                if logits.size(0) != 1 or logits.size(1) != 1:
+                    return None
+            elif logits.dim() == 2:
+                if logits.size(0) != 1:
+                    return None
+            else:
+                return None
+        elif mode == "tuple":
+            logits, new_cache = out
+        elif mode == "dict":
+            logits, new_cache = out["logits"], out.get("cache")
+        else:
+            logits, new_cache = out, None
+        if new_cache is not None:
+            cache = new_cache
+        # Fused greedy step: single argmax, device-side, scalar sync only.
+        nxt = int(torch.argmax(logits.float(), dim=-1).item())
+        generated.append(nxt)
+        if check_eos and nxt in eos_set:
+            break
+        step_in.fill_(nxt)
+    return generated
+
+
+@torch.no_grad()
+def generate_batch_greedy(
+    model,
+    tokenizer,
+    prompts,
+    max_new_tokens=64,
+    device="cpu",
+    stop_on_eos=True,
+):
+    """Greedy batch decode: one encoder pass for B prompts (FORGE-DECODE).
+
+    Pads prompts right, runs a single ``init_decode_cache`` + one
+    ``forward_step`` per token for the whole batch, so MPS launch/sync cost
+    is amortized across rows. Per-row token ids are mathematically identical
+    to calling :func:`generate_greedy` (temperature=0.0) per prompt: rows are
+    independent, pads are excluded via the encoder mask, and only decoded
+    (non-pad) tokens enter the self-attention history.
+
+    Args:
+        model: CED model with ``init_decode_cache`` / ``forward_step``.
+        tokenizer: tokenizer with ``encode``/``decode`` (+ optional ids).
+        prompts: list of prompt strings.
+        max_new_tokens: new tokens per prompt (early EOS stop per row).
+        device: torch device string.
+        stop_on_eos: halt each row at any known EOS id.
+
+    Returns:
+        dict ``{texts, token_ids, encoder_forwards}`` with one entry per
+        prompt. ``encoder_forwards`` is 1 (single shared encode). Falls back
+        to sequential :func:`generate_greedy` when the model uses a
+        non-canonical ``forward_step`` convention.
+    """
+    try:
+        max_new_tokens = int(max_new_tokens)
+    except Exception:
+        max_new_tokens = 64
+    max_new_tokens = max(0, max_new_tokens)
+    try:
+        stop_on_eos = bool(stop_on_eos)
+    except Exception:
+        stop_on_eos = True
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    try:
+        prompts = list(prompts)
+    except Exception:
+        prompts = [prompts]
+    if len(prompts) == 0:
+        return {"texts": [], "token_ids": [], "encoder_forwards": 0}
+    clean = []
+    for p in prompts:
+        if isinstance(p, str):
+            clean.append(p)
+        else:
+            try:
+                clean.append(str(p))
+            except Exception:
+                clean.append("")
+    prompts = clean
+    try:
+        model.eval()
+    except Exception:
+        pass
+    try:
+        model.to(device)
+    except Exception:
+        pass
+
+    eos_list = _eos_ids(tokenizer)
+    try:
+        check_eos = bool(stop_on_eos) and bool(eos_list)
+        eos_set = frozenset(int(e) for e in eos_list) if check_eos else frozenset()
+        check_eos = check_eos and len(eos_set) > 0
+    except Exception:
+        check_eos, eos_set = False, frozenset()
+    bos_id = _tk_bos(tokenizer)
+
+    rows = []
+    for p in prompts:
+        ids = [int(x) for x in _tk_encode(tokenizer, p)]
+        if len(ids) == 0 and bos_id is not None:
+            ids = [int(bos_id)]
+        if len(ids) == 0:
+            ids = [int(bos_id) if bos_id is not None else 0]
+        rows.append(ids)
+    # Pad id: tokenizer first, then model config, then 0.
+    pad_id = 0
+    for attr in ("pad_id", "pad_token_id"):
+        try:
+            v = getattr(tokenizer, attr, None)
+            if v is not None:
+                pad_id = int(v)
+                break
+        except Exception:
+            continue
+    else:
+        try:
+            pad_id = int(getattr(getattr(model, "config", None), "pad_token_id", 0))
+        except Exception:
+            pad_id = 0
+    try:
+        pad_id = int(pad_id)
+    except Exception:
+        pad_id = 0
+    batch = len(rows)
+    width = max(len(r) for r in rows)
+    padded = [r + [pad_id] * (width - len(r)) for r in rows]
+    has_pad = any(len(r) != width for r in rows)
+    input_ids = torch.tensor(padded, dtype=torch.long, device=device)
+    attn = None
+    if has_pad:
+        attn = torch.ones((batch, width), dtype=torch.long, device=device)
+        for i, r in enumerate(rows):
+            try:
+                if len(r) < width:
+                    attn[i, len(r):] = 0
+            except Exception:
+                pass
+
+    _reset_enc(model)
+    start = _enc_count(model)
+    if not hasattr(model, "init_decode_cache") or not callable(
+        getattr(model, "init_decode_cache")
+    ):
+        raise AttributeError(
+            "model missing init_decode_cache (need CED decode-cache API)"
+        )
+    try:
+        cache = model.init_decode_cache(input_ids, attn)
+    except TypeError:
+        try:
+            cache = model.init_decode_cache(input_ids)
+        except Exception as e:
+            raise RuntimeError("init_decode_cache failed: %r" % (e,)) from e
+    if not hasattr(model, "forward_step") or not callable(
+        getattr(model, "forward_step")
+    ):
+        raise AttributeError("model missing forward_step (need CED decode-cache API)")
+    if not has_pad:
+        # Same hoisted mask normalization as the single fast path.
+        try:
+            if isinstance(cache, dict) and cache.get("enc_mask") is not None:
+                cache["enc_mask"] = None
+        except Exception:
+            pass
+
+    gen_lists = [list(r) for r in rows]
+    cur_cpu = torch.tensor([[r[-1]] for r in rows], dtype=torch.long)
+    try:
+        step_in = torch.empty((batch, 1), dtype=torch.long, device=device)
+        step_in.copy_(cur_cpu)
+    except Exception:
+        step_in = input_ids[:, -1:]
+    done = [False] * batch
+    mode = None
+    use_kw = False
+
+    def _sequential_fallback():
+        texts, ids = [], []
+        for p in prompts:
+            o = generate_greedy(
+                model, tokenizer, p, max_new_tokens=max_new_tokens,
+                device=device, temperature=0.0, stop_on_eos=stop_on_eos,
+            )
+            texts.append(o["text"])
+            ids.append(o["token_ids"])
+        return {"texts": texts, "token_ids": ids, "encoder_forwards": 1}
+
+    for _ in range(max_new_tokens):
+        if all(done):
+            break
+        try:
+            out = model.forward_step(step_in, cache=cache) if use_kw else model.forward_step(step_in, cache)
+        except TypeError:
+            if use_kw:
+                raise
+            use_kw = True
+            try:
+                out = model.forward_step(step_in, cache=cache)
+            except Exception as e:
+                raise RuntimeError("forward_step failed: %r" % (e,)) from e
+        if mode is None:
+            if isinstance(out, (tuple, list)) and len(out) == 2 and isinstance(out[0], torch.Tensor):
+                mode = "tuple"
+            elif isinstance(out, dict) and isinstance(out.get("logits", None), torch.Tensor) and (
+                "cache" in out or ("past" not in out and "cache_out" not in out)
+            ):
+                mode = "dict"
+            elif isinstance(out, torch.Tensor):
+                mode = "tensor"
+            else:
+                return _sequential_fallback()
+        if mode == "tuple":
+            logits, new_cache = out
+        elif mode == "dict":
+            logits, new_cache = out["logits"], out.get("cache")
+        else:
+            logits, new_cache = out, None
+        if new_cache is not None:
+            cache = new_cache
+        if logits.dim() == 3:
+            if logits.size(0) != batch or logits.size(1) != 1:
+                return _sequential_fallback()
+            last = logits[:, -1, :]
+        elif logits.dim() == 2:
+            if logits.size(0) != batch:
+                return _sequential_fallback()
+            last = logits
+        else:
+            return _sequential_fallback()
+        # One kernel + one small sync for all B rows (amortized per token).
+        try:
+            nxt_ids = [int(v) for v in torch.argmax(last.float(), dim=-1).tolist()]
+        except Exception:
+            return _sequential_fallback()
+        if len(nxt_ids) != batch:
+            return _sequential_fallback()
+        for i in range(batch):
+            if done[i]:
+                continue
+            nxt = nxt_ids[i]
+            gen_lists[i].append(nxt)
+            if check_eos and nxt in eos_set:
+                done[i] = True
+            else:
+                try:
+                    cur_cpu[i, 0] = nxt
+                except Exception:
+                    pass
+        if all(done):
+            break
+        for i in range(batch):
+            if done[i]:
+                try:
+                    cur_cpu[i, 0] = pad_id
+                except Exception:
+                    pass
+        try:
+            step_in.copy_(cur_cpu)
+        except Exception:
+            try:
+                step_in = torch.tensor(cur_cpu.tolist(), dtype=torch.long, device=device).view(batch, 1)
+            except Exception:
+                break
+
+    end = _enc_count(model)
+    delta = int(end) - int(start)
+    if delta != 1:
+        raise RuntimeError(
+            "KV-reuse violated: encoder_forward_count delta=%d (expected 1). " % delta
+        )
+    texts = [_tk_decode(tokenizer, ids) for ids in gen_lists]
+    return {"texts": texts, "token_ids": gen_lists, "encoder_forwards": delta}
+
+
+@torch.no_grad()
 def generate_greedy(
     model,
     tokenizer,
@@ -495,41 +860,70 @@ def generate_greedy(
     except Exception:
         prev = input_ids[:, -1:]
 
-    for _ in range(max_new_tokens):
-        try:
-            out = model.forward_step(prev, cache)
-        except TypeError:
-            # Try keyword form.
-            try:
-                out = model.forward_step(prev, cache=cache)
-            except Exception as e:
-                raise RuntimeError("forward_step failed: %r" % (e,)) from e
-        logits, new_cache = _extract_step_logits(out)
-        if new_cache is not None:
-            cache = new_cache
-        # logits: [B,1,V] or [B,V] -> take last position.
-        if logits.dim() == 3:
-            logits = logits[:, -1, :]
-        logits = logits.float().cpu()
-        # ✨ One sampler spell to rule them all (keeps greedy bit-identical). ✨
-        nxt = _sample_next_token(
-            logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            generated_ids=generated,
-            repetition_window=repetition_window,
+    # FORGE-DECODE fast path: pure-greedy (temperature<=0, no repetition
+    # penalty) runs the fused device-side loop above. top_k/top_p are
+    # ignored on the greedy branch by construction, so they need no guard.
+    # Bit-identical to the legacy loop below; a None return means the model
+    # uses a foreign return convention -> rebuild a pristine cache (counter
+    # resets to exactly 1) and run the legacy loop for identical results.
+    _fast_done = False
+    if temperature <= 0.0 and repetition_penalty == 1.0 and max_new_tokens > 0:
+        _fr = _greedy_fast_loop(
+            model, cache, prev, generated, max_new_tokens,
+            stop_on_eos, eos_list, device,
         )
-        generated.append(nxt)
-        if stop_on_eos and eos_list and int(nxt) in [int(e) for e in eos_list]:
-            break
-        elif stop_on_eos and not eos_list and eos_id is not None and nxt == int(eos_id):
-            break
-        try:
-            prev = torch.tensor([[nxt]], dtype=torch.long, device=device)
-        except Exception:
-            break
+        if _fr is not None:
+            generated = _fr
+            _fast_done = True
+        else:
+            try:
+                cache = model.init_decode_cache(input_ids, attention_mask)
+            except TypeError:
+                cache = model.init_decode_cache(input_ids)
+            generated = list(prompt_ids)
+            try:
+                prev = torch.tensor(
+                    [[generated[-1]]], dtype=torch.long, device=device
+                )
+            except Exception:
+                prev = input_ids[:, -1:]
+
+    if not _fast_done:
+        for _ in range(max_new_tokens):
+            try:
+                out = model.forward_step(prev, cache)
+            except TypeError:
+                # Try keyword form.
+                try:
+                    out = model.forward_step(prev, cache=cache)
+                except Exception as e:
+                    raise RuntimeError("forward_step failed: %r" % (e,)) from e
+            logits, new_cache = _extract_step_logits(out)
+            if new_cache is not None:
+                cache = new_cache
+            # logits: [B,1,V] or [B,V] -> take last position.
+            if logits.dim() == 3:
+                logits = logits[:, -1, :]
+            logits = logits.float().cpu()
+            # ✨ One sampler spell to rule them all (keeps greedy bit-identical). ✨
+            nxt = _sample_next_token(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                generated_ids=generated,
+                repetition_window=repetition_window,
+            )
+            generated.append(nxt)
+            if stop_on_eos and eos_list and int(nxt) in [int(e) for e in eos_list]:
+                break
+            elif stop_on_eos and not eos_list and eos_id is not None and nxt == int(eos_id):
+                break
+            try:
+                prev = torch.tensor([[nxt]], dtype=torch.long, device=device)
+            except Exception:
+                break
 
     end = _enc_count(model)
     delta = int(end) - int(start)
@@ -1017,9 +1411,15 @@ def main(argv=None):
         model, tok = _build_smoke_model_and_tokenizer(
             vocab_size=512, d_model=32, seq_len=32
         )
+        import time as _time
+
+        _t0 = _time.time()
         out = generate_greedy(
             model, tok, "Once upon a time", max_new_tokens=16, device="cpu"
         )
+        _dt = max(1e-9, _time.time() - _t0)
+        _new = max(1, len(out["token_ids"]) - len(_tk_encode(tok, "Once upon a time")))
+        print("[generate] smoke decode: %d new tokens in %.3fs (%.0f tok/s)" % (_new, _dt, _new / _dt))
         print("[generate] text: %s" % out["text"][:500])
         print("[generate] tokens: %d encoder_forwards=%d" % (len(out["token_ids"]), out["encoder_forwards"]))
         assert out["encoder_forwards"] == 1, "smoke KV-reuse check failed"

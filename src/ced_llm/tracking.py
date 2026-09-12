@@ -73,7 +73,7 @@ class RunTracker:
     """File-backed run logger with optional TensorBoard mirror."""
 
     def __init__(self, run_dir="runs", run_name=None, config=None,
-                 tensorboard=False, enabled=True):
+                 tensorboard=False, enabled=True, buffer_rows=1):
         self.enabled = bool(enabled)
         self.tb_wanted = bool(tensorboard)
         self.tb_writer = None
@@ -81,6 +81,15 @@ class RunTracker:
         self.dir = None
         self._metrics_path = None
         self._warned_tb = False
+        # Overhead path: keep one append handle open instead of open/close
+        # per log() call. Default buffer_rows=1 flushes every row, so file
+        # bytes + read-your-writes visibility are identical to before.
+        try:
+            self._buffer_rows = max(1, int(buffer_rows))
+        except Exception:
+            self._buffer_rows = 1
+        self._buf = []
+        self._fh = None
         if not self.enabled:
             return
         name = str(run_name) if run_name else "run-%s" % _utc_stamp()
@@ -132,11 +141,68 @@ class RunTracker:
         obj.dir = None
         obj._metrics_path = None
         obj._warned_tb = False
+        obj._buffer_rows = 1
+        obj._buf = []
+        obj._fh = None
         return obj
 
     @property
     def active(self):
         return bool(self.enabled and self.dir)
+
+    def _write_rows(self, rows):
+        """Append pre-serialized rows via the persistent handle (never raises)."""
+        if not rows:
+            return
+        try:
+            fh = self._fh
+            if fh is None or getattr(fh, "closed", False):
+                fh = open(self._metrics_path, "a")
+                self._fh = fh
+            for line in rows:
+                fh.write(line)
+            # Write-through by default (buffer_rows=1): identical visibility.
+            # Batched mode flushes only on buffer fill / flush() / close().
+            if len(rows) >= 1 and (
+                self._buffer_rows <= 1 or len(self._buf) == 0
+            ):
+                try:
+                    fh.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def flush(self):
+        """Flush any buffered rows + TB writer. Never raises."""
+        try:
+            if self._buf:
+                rows = self._buf
+                self._buf = []
+                # Bypass _write_rows buffering to force a flush.
+                try:
+                    fh = self._fh
+                    if fh is None or getattr(fh, "closed", False):
+                        fh = open(self._metrics_path, "a")
+                        self._fh = fh
+                    for line in rows:
+                        fh.write(line)
+                    fh.flush()
+                except Exception:
+                    pass
+            else:
+                try:
+                    if self._fh is not None:
+                        self._fh.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self.tb_active and self.tb_writer is not None:
+                self.tb_writer.flush()
+        except Exception:
+            pass
 
     def log(self, step, metrics):
         """Append one metrics row. Never raises; no-op when disabled."""
@@ -157,8 +223,20 @@ class RunTracker:
         except Exception:
             return
         try:
-            with open(self._metrics_path, "a") as f:
-                f.write(json.dumps(row, sort_keys=True) + "\n")
+            line = json.dumps(row, sort_keys=True) + "\n"
+        except Exception:
+            return
+        # Buffer when requested; default (buffer_rows=1) writes through so
+        # load_metrics() sees the row immediately (same as before), while
+        # still saving one open()/close() syscall pair per log().
+        try:
+            if self._buffer_rows > 1:
+                self._buf.append(line)
+                if len(self._buf) >= self._buffer_rows:
+                    rows, self._buf = self._buf, []
+                    self._write_rows(rows)
+            else:
+                self._write_rows([line])
         except Exception:
             pass
         if self.tb_active and self.tb_writer is not None:
@@ -168,8 +246,12 @@ class RunTracker:
                         continue
                     if isinstance(v, (int, float)):
                         self.tb_writer.add_scalar(str(k), float(v), step)
+                # Batch TB flush with file flush: write-through mode flushes
+                # every row (identical to before); buffered mode flushes only
+                # when the file buffer drained (or on flush()/close()).
                 try:
-                    self.tb_writer.flush()
+                    if self._buffer_rows <= 1 or not self._buf:
+                        self.tb_writer.flush()
                 except Exception:
                     pass
             except Exception:
@@ -179,6 +261,20 @@ class RunTracker:
         """Write summary.json and close the TB writer. Never raises."""
         if not self.active:
             return None
+        try:
+            self.flush()
+        except Exception:
+            pass
+        try:
+            fh = self._fh
+            self._fh = None
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         payload = _safe_jsonable({"summary": dict(summary or {})})
         payload["summary"]["_closed_utc"] = _utc_stamp()
         path = os.path.join(self.dir, "summary.json")

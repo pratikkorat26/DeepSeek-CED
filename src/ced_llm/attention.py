@@ -6,12 +6,117 @@ GQA/MLA, no sparse pattern, and no RoPE in v1 (positions come from learned
 embeddings in ``model.py``).
 """
 
-from typing import Optional
+from typing import Optional, Tuple
+
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+# ---------------------------------------------------------------------------
+# SDPA backend selection (FORGE-MODEL: MPS measurement)
+# ---------------------------------------------------------------------------
+# On Apple MPS all SDPBackend choices lower to the same MPS kernel (measured
+# ~0.039ms tiny-causal and ~0.025ms decode shapes across MATH/FLASH/
+# EFFICIENT/CUDNN within noise; SDPA itself is <1% of the ~3.9ms/token
+# decode cost, proving overhead-bound). Default is therefore direct
+# ``scaled_dot_product_attention`` with NO per-forward context overhead
+# (bit-identical). An explicit backend can be forced via env
+# ``CED_SDPA_BACKEND=math|flash|efficient|mem|cudnn|auto`` or per-call
+# override for experimentation.
+def preferred_sdpa_backend(device=None):
+    """Return the preferred SDPBackend for ``device`` or ``None`` for auto.
+
+    ``None`` means "call SDPA directly, no context" (fastest, bit-identical).
+    On MPS this is MATH-equivalent; explicit env override still honored.
+    """
+    try:
+        env = str(os.environ.get("CED_SDPA_BACKEND", "auto")).strip().lower()
+    except Exception:
+        env = "auto"
+    if env in ("math",):
+        try:
+            from torch.nn.attention import SDPBackend as _B
+
+            return _B.MATH
+        except Exception:
+            return None
+    if env in ("flash", "flash_attention"):
+        try:
+            from torch.nn.attention import SDPBackend as _B
+
+            return _B.FLASH_ATTENTION
+        except Exception:
+            return None
+    if env in ("efficient", "mem", "mem_efficient", "memory"):
+        try:
+            from torch.nn.attention import SDPBackend as _B
+
+            return _B.EFFICIENT_ATTENTION
+        except Exception:
+            return None
+    if env in ("cudnn", "cudnn_attention"):
+        try:
+            from torch.nn.attention import SDPBackend as _B
+
+            return _B.CUDNN_ATTENTION
+        except Exception:
+            return None
+    # "auto" (default): no context -> direct call (zero overhead).
+    return None
+
+
+def _sdpa(q: Tensor, k: Tensor, v: Tensor, **kwargs) -> Tensor:
+    """SDPA with optional backend context (default: direct, no overhead).
+
+    Extra kwarg ``_backend`` may hold an SDPBackend to force; otherwise the
+    env-selected ``preferred_sdpa_backend`` is consulted once per call (cheap
+    string check, no context when auto).
+    """
+    backend = kwargs.pop("_backend", None)
+    if backend is None:
+        backend = preferred_sdpa_backend(getattr(q, "device", None))
+    if backend is None:
+        return F.scaled_dot_product_attention(q, k, v, **kwargs)
+    try:
+        from torch.nn.attention import sdpa_kernel as _ctx
+
+        with _ctx(backend):
+            return F.scaled_dot_product_attention(q, k, v, **kwargs)
+    except Exception:
+        return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+
+def _qkv_param_key(*projs) -> tuple:
+    """Cache key for fused-QKV weights: (ptr, version, device, dtype)."""
+    key = []
+    for p in projs:
+        try:
+            w = p.weight
+        except Exception:
+            key.append((0, 0, "", ""))
+            continue
+        try:
+            ptr = w.data_ptr()
+        except Exception:
+            ptr = 0
+        try:
+            ver = int(getattr(w, "_version", 0))
+        except Exception:
+            ver = 0
+        try:
+            dev = str(w.device)
+        except Exception:
+            dev = ""
+        try:
+            dt = str(w.dtype)
+        except Exception:
+            dt = ""
+        key.append((ptr, ver, dev, dt))
+    return tuple(key)
 
 
 def split_heads(x: Tensor, nhead: int) -> Tensor:
@@ -104,7 +209,9 @@ class CausalSelfAttention(nn.Module):
     key positions flagged by ``key_padding_mask`` are additionally blocked.
     """
 
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self, d_model: int, nhead: int, dropout: float = 0.0, fused_qkv: bool = True
+    ) -> None:
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError(
@@ -118,6 +225,62 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.resid_dropout = nn.Dropout(dropout)
+        # Fused QKV: single GEMM for q/k/v (3 launches -> 1). Bit-identical
+        # (each output element is an independent dot product; batching the
+        # output dim does not change reduction order). Disabled only via flag.
+        self.use_fused_qkv = bool(fused_qkv)
+        self._fused_weight: Optional[Tensor] = None
+        self._fused_key: Optional[tuple] = None
+
+    def _fused_qkv_weight(self) -> Optional[Tensor]:
+        """Stacked [3D, D] QKV weight, cached in inference only."""
+        if not self.use_fused_qkv:
+            return None
+        # Training / grad-enabled: use the separate projections (original
+        # path). A fresh fused cat per forward costs an extra [3D, D] alloc
+        # with zero launch savings on tiny shapes, and the separate linears
+        # carry identical grad flow. Fusion pays off in inference only.
+        if self.training or torch.is_grad_enabled():
+            return None
+        # Inference (eval + no_grad): reuse cached stack until weights change.
+        try:
+            key = _qkv_param_key(self.q_proj, self.k_proj, self.v_proj)
+        except Exception:
+            key = None
+        try:
+            if (
+                self._fused_weight is not None
+                and self._fused_key is not None
+                and key is not None
+                and self._fused_key == key
+            ):
+                return self._fused_weight
+        except Exception:
+            pass
+        try:
+            fused = torch.cat(
+                [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
+                dim=0,
+            ).detach()
+            # Keep on the same device/dtype as sources (cat already does).
+            self._fused_weight = fused
+            self._fused_key = key
+            return fused
+        except Exception:
+            return None
+
+    def _qkv(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """Project ``x`` to (q, k, v) un-split ``[B, T, D]`` (fused fast path)."""
+        if self.use_fused_qkv:
+            w = self._fused_qkv_weight()
+            if w is not None:
+                try:
+                    qkv = F.linear(x, w)
+                    q, k, v = qkv.chunk(3, dim=-1)
+                    return q, k, v
+                except Exception:
+                    pass
+        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """Attend causally over ``x``.
@@ -130,15 +293,14 @@ class CausalSelfAttention(nn.Module):
             Tensor of shape ``[B, T, D]``.
         """
         batch, seq_len, _ = x.shape
-        q = split_heads(self.q_proj(x), self.nhead)
-        k = split_heads(self.k_proj(x), self.nhead)
-        v = split_heads(self.v_proj(x), self.nhead)
+        q_u, k_u, v_u = self._qkv(x)
+        q = split_heads(q_u, self.nhead)
+        k = split_heads(k_u, self.nhead)
+        v = split_heads(v_u, self.nhead)
         dropout_p = self.dropout if self.training else 0.0
         if _is_no_pad_mask(key_padding_mask):
             # Fast path: no pads -> fused causal kernel, no [B,1,T,T] alloc.
-            y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, dropout_p=dropout_p
-            )
+            y = _sdpa(q, k, v, is_causal=True, dropout_p=dropout_p)
         else:
             if key_padding_mask.shape != (batch, seq_len):
                 raise ValueError(
@@ -146,9 +308,7 @@ class CausalSelfAttention(nn.Module):
                     % (batch, seq_len, tuple(key_padding_mask.shape))
                 )
             attn_mask = causal_attend_mask(key_padding_mask)
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p
-            )
+            y = _sdpa(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
         out = self.out_proj(merge_heads(y))
         # Skip dropout dispatch when it is identity (p==0 or eval).
         if self.training and self.dropout != 0.0:
@@ -220,9 +380,7 @@ class GlobalCrossAttention(nn.Module):
                 batch_k, 1, 1, len_k
             )
         dropout_p = self.dropout if self.training else 0.0
-        y = F.scaled_dot_product_attention(
-            queries, keys, values, attn_mask=attn_mask, dropout_p=dropout_p
-        )
+        y = _sdpa(queries, keys, values, attn_mask=attn_mask, dropout_p=dropout_p)
         out = self.out_proj(merge_heads(y))
         if self.training and self.dropout != 0.0:
             out = self.resid_dropout(out)

@@ -96,16 +96,99 @@ except Exception:
         build_optimizer = None
 
 
+def _resolve_device(name):
+    """Resolve --device (cpu/mps/auto/cuda) to a concrete string (never raises)."""
+    try:
+        s = str(name or "cpu").lower()
+    except Exception:
+        return "cpu"
+    if s == "auto":
+        try:
+            if torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+    return s
+
+
+def _autocast_ctx(device, dtype):
+    """Null context for fp32 (default, bit-identical); autocast otherwise."""
+    try:
+        d = str(dtype or "fp32").lower()
+    except Exception:
+        d = "fp32"
+    if d in ("fp32", "fp", "float32", "", "none"):
+        from contextlib import nullcontext
+        return nullcontext()
+    try:
+        dev = str(device or "cpu").lower()
+        if dev not in ("mps", "cuda", "cpu"):
+            dev = "cpu"
+        amp = torch.bfloat16 if d in ("bf16", "bfloat16") else torch.float16
+        # CPU autocast with fp16 is slow/unsupported on some builds; only
+        # MPS/CUDA take the fast path. CPU+bf16 is allowed.
+        if dev == "cpu" and amp is torch.float16:
+            from contextlib import nullcontext
+            return nullcontext()
+        return torch.autocast(device_type=dev, dtype=amp)
+    except Exception:
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+def _maybe_compile(model, want):
+    """Opt-in torch.compile (default off). Never breaks training on failure."""
+    try:
+        if not bool(want):
+            return model
+    except Exception:
+        return model
+    try:
+        # The encoder_forward_count int attr triggers dynamo recompiles on
+        # tiny shapes; allow unspec ints so one graph survives counting.
+        try:
+            import torch._dynamo.config as _dc
+            _dc.allow_unspec_int_on_nn_module = True
+        except Exception:
+            pass
+        return torch.compile(model)
+    except Exception as e:
+        print("[train] WARNING: --compile requested but failed (%r); using eager." % (e,),
+              file=sys.stderr)
+        return model
+
+
 def _new_optimizer(args, model, lr):
     """Build the CLI-selected optimizer (AdamW default; Muon optional)."""
     try:
         if build_optimizer is not None:
+            kw = dict(
+                muon_lr=float(getattr(args, "muon_lr", 0.02)),
+                momentum=float(getattr(args, "muon_momentum", 0.95)),
+            )
+            # foreach/fused fast paths: opt-in only (default None == vanilla).
+            try:
+                if bool(getattr(args, "fused", False)):
+                    kw["fused"] = True
+                elif bool(getattr(args, "foreach", False)):
+                    kw["foreach"] = True
+            except Exception:
+                pass
+            try:
+                kw["ns_steps"] = int(getattr(args, "muon_ns_steps", 5))
+            except Exception:
+                pass
             return build_optimizer(
                 getattr(args, "optimizer", "adamw"),
                 model.parameters(),
                 lr=float(lr),
-                muon_lr=float(getattr(args, "muon_lr", 0.02)),
-                momentum=float(getattr(args, "muon_momentum", 0.95)),
+                **kw,
             )
     except Exception:
         pass
@@ -122,12 +205,26 @@ def _new_tracker(args, extra_config):
             cfg.update(dict(extra_config or {}))
         except Exception:
             pass
-        return RunTracker(
-            run_dir=getattr(args, "run_dir", "runs"),
-            run_name=getattr(args, "run_name", None),
-            config=cfg,
-            tensorboard=bool(getattr(args, "tensorboard", False)),
-        )
+        try:
+            buf = int(getattr(args, "tracker_buffer", 1) or 1)
+        except Exception:
+            buf = 1
+        try:
+            return RunTracker(
+                run_dir=getattr(args, "run_dir", "runs"),
+                run_name=getattr(args, "run_name", None),
+                config=cfg,
+                tensorboard=bool(getattr(args, "tensorboard", False)),
+                buffer_rows=buf,
+            )
+        except TypeError:
+            # Fallback tracker without buffer_rows (offline no-op shim).
+            return RunTracker(
+                run_dir=getattr(args, "run_dir", "runs"),
+                run_name=getattr(args, "run_name", None),
+                config=cfg,
+                tensorboard=bool(getattr(args, "tensorboard", False)),
+            )
     except Exception:
         try:
             return RunTracker.disabled()
@@ -564,9 +661,19 @@ def train_one_epoch(
     pad_token_id=None,
     grad_clip=1.0,
     log_every=20,
+    dtype="fp32",
+    loss_sync_every=1,
     **kwargs,
 ):
-    """One training epoch. Returns {'loss': avg_loss, 'steps': n}."""
+    """One training epoch. Returns {'loss': avg_loss, 'steps': n}.
+
+    Overhead flags (defaults preserve historical CPU fp32 numerics exactly):
+      dtype: 'fp32' (default, no autocast) or 'fp16'/'bf16' autocast on
+        MPS/CUDA. fp16/bf16 change numerics; measure before assuming a win.
+      loss_sync_every: 1 (default) syncs loss.item() every step (identical
+        avg). >1 accumulates the loss on-device and syncs once per K steps
+        + once at the end (fewer MPS syncs; avg may differ in last ulp).
+    """
     # Back-compat: allow pad_token_id passed positionally via kwargs aliases.
     if pad_token_id is None:
         pad_token_id = kwargs.get("pad_id", kwargs.get("pad", None))
@@ -578,8 +685,21 @@ def train_one_epoch(
         model.to(device)
     except Exception:
         pass
+    try:
+        _sync_every = int(kwargs.get("loss_sync_every", loss_sync_every) or 1)
+    except Exception:
+        _sync_every = 1
+    try:
+        _dtype = str(kwargs.get("dtype", dtype) or "fp32")
+    except Exception:
+        _dtype = "fp32"
+    if _sync_every < 1:
+        _sync_every = 1
     total = 0.0
     n = 0
+    # Deferred-sync accumulator (only used when _sync_every > 1).
+    _accum = None
+    _accum_n = 0
     try:
         max_steps = int(max_steps) if max_steps is not None else None
     except Exception:
@@ -609,7 +729,8 @@ def train_one_epoch(
         except Exception:
             pass
         optimizer.zero_grad(set_to_none=True)
-        loss, _ = compute_loss(model, batch, pad_token_id=pad_token_id)
+        with _autocast_ctx(device, _dtype):
+            loss, _ = compute_loss(model, batch, pad_token_id=pad_token_id)
         try:
             loss.backward()
         except Exception:
@@ -617,7 +738,9 @@ def train_one_epoch(
             continue
         try:
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                _gc = float(grad_clip)
+                if _gc > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), _gc)
         except Exception:
             pass
         optimizer.step()
@@ -626,11 +749,39 @@ def train_one_epoch(
                 scheduler.step()
             except Exception:
                 pass
-        # loss.item() already syncs; detach().cpu() is redundant overhead.
-        total += float(loss.item())
         n += 1
+        if _sync_every <= 1:
+            # loss.item() already syncs; detach().cpu() is redundant overhead.
+            total += float(loss.item())
+        else:
+            try:
+                d = loss.detach()
+                _accum = d if _accum is None else (_accum + d)
+                _accum_n += 1
+                if (_accum_n % _sync_every) == 0 or (
+                    max_steps is not None and n >= max_steps
+                ):
+                    total += float(_accum.item())
+                    _accum = None
+                    _accum_n = 0
+                    # NOTE: total currently holds the SUM; avg divides by n
+                    # at the end, but batched item() summed K losses at once
+                    # (same sum, fewer syncs; fp32 rounding may differ 1ulp).
+            except Exception:
+                total += float(loss.item())
         if max_steps is not None and n >= max_steps:
             break
+    # Flush any deferred accumulator. total holds the sum of synced chunks
+    # plus (below) the trailing partial chunk.
+    try:
+        if _accum is not None and _accum_n > 0:
+            # _accum is a sum of _accum_n losses; total already holds the sum
+            # of prior chunks, so add this chunk's sum once.
+            # To recover the true sum we tracked total as sum-of-chunks, but
+            # above we did total += float(chunk_sum) per flush, so just add.
+            total += float(_accum.item())
+    except Exception:
+        pass
     avg = total / max(1, n)
     return {"loss": avg, "steps": n}
 
@@ -640,6 +791,10 @@ def evaluate(model, dataloader, device="cpu", pad_token_id=None, max_batches=Non
     """Mean loss + perplexity. Returns {'loss': float, 'ppl': float}."""
     if pad_token_id is None:
         pad_token_id = kwargs.get("pad_id", kwargs.get("pad", None))
+    try:
+        _dtype = str(kwargs.get("dtype", "fp32") or "fp32")
+    except Exception:
+        _dtype = "fp32"
     try:
         model.eval()
     except Exception:
@@ -677,7 +832,8 @@ def evaluate(model, dataloader, device="cpu", pad_token_id=None, max_batches=Non
         except Exception:
             pass
         try:
-            loss, _ = compute_loss(model, batch, pad_token_id=pad_token_id)
+            with _autocast_ctx(device, _dtype):
+                loss, _ = compute_loss(model, batch, pad_token_id=pad_token_id)
         except Exception:
             continue
         # Under @torch.no_grad, detach().cpu() is pure overhead.
@@ -780,13 +936,50 @@ def build_argparser():
                    help="Muon learning rate for 2D params (Muon scale, not AdamW scale)")
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon momentum coefficient")
+    # FORGE-LOOP speed flags (all defaults preserve CPU fp32 numerics exactly).
+    p.add_argument("--device", type=str, default="cpu",
+                   choices=["cpu", "mps", "cuda", "auto"],
+                   help="train device (default cpu; auto picks mps/cuda if available)")
+    p.add_argument("--dtype", type=str, default="fp32",
+                   choices=["fp32", "fp16", "bf16"],
+                   help="fp32 default (identical); fp16/bf16 autocast on mps/cuda (measure!)")
+    p.add_argument("--foreach", action="store_true",
+                   help="AdamW foreach=True fast path (opt-in; ~+6%% MPS smoke)")
+    p.add_argument("--fused", action="store_true",
+                   help="AdamW fused=True fast path (opt-in; ~+20%% MPS smoke, ~+2%% real)")
+    p.add_argument("--muon-ns-steps", type=int, default=5,
+                   help="Muon Newton-Schulz iters (default 5 identical; 3 is cheaper)")
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="grad clip norm (default 1.0 identical; <=0 disables for speed)")
+    p.add_argument("--loss-sync-every", type=int, default=1,
+                   help="sync loss.item() every K steps (default 1 identical; >1 fewer MPS syncs)")
+    p.add_argument("--tracker-buffer", type=int, default=1,
+                   help="tracker rows buffered before flush (default 1 identical)")
+    p.add_argument("--compile", action="store_true",
+                   help="opt-in torch.compile (measured SLOWER on tiny MPS shapes)")
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="DataLoader workers for tinystories path (default 0 identical)")
+    p.add_argument("--prefetch-factor", type=int, default=None,
+                   help="prefetch per worker (only when --num-workers>0)")
+    p.add_argument("--pin-memory", action="store_true",
+                   help="DataLoader pin_memory (opt-in)")
     return p
 
 
 def main(argv=None):
     args = build_argparser().parse_args(argv)
     set_seed(args.seed)
-    device = "cpu"
+    device = _resolve_device(getattr(args, "device", "cpu"))
+    try:
+        _dtype = str(getattr(args, "dtype", "fp32") or "fp32").lower()
+    except Exception:
+        _dtype = "fp32"
+    try:
+        _grad_clip = float(getattr(args, "grad_clip", 1.0))
+        if not (_grad_clip > 0):
+            _grad_clip = None  # <=0 disables clipping (opt-in speed path)
+    except Exception:
+        _grad_clip = 1.0
 
     if args.smoke:
         steps = 60
@@ -795,15 +988,16 @@ def main(argv=None):
         vocab_size = 512
         d_model, n_enc, n_dec, nhead, dim_ff = 64, 1, 1, 4, 256
         lr = 1e-3  # slightly higher to guarantee visible decrease on toy data
-        print("[train] SMOKE mode: d_model=64 1+1 layers seq=32 batch=4 steps=%d" % steps)
+        print("[train] SMOKE mode: d_model=64 1+1 layers seq=32 batch=4 steps=%d device=%s dtype=%s" % (steps, device, _dtype))
         loader = _fixed_toy_loader(vocab_size, seq_len, batch_size, num_batches=8, seed=args.seed)
         eval_loader = loader
         config = _make_config(vocab_size, d_model, n_enc, n_dec, nhead, dim_ff, seq_len, 0.0, 0)
         model = _make_model(config)
         model.to(device)
+        model = _maybe_compile(model, getattr(args, "compile", False))
         opt = _new_optimizer(args, model, lr)
         # Initial loss.
-        init = evaluate(model, eval_loader, device=device)
+        init = evaluate(model, eval_loader, device=device, dtype=_dtype)
         print("[train] smoke init loss=%.4f ppl=%.2f" % (init["loss"], init["ppl"]))
         tracker = _new_tracker(args, {
             "mode": "smoke", "steps": steps, "seq_len": seq_len,
@@ -827,15 +1021,23 @@ def main(argv=None):
                 if n >= steps:
                     break
                 opt.zero_grad(set_to_none=True)
-                loss, _ = compute_loss(model, batch)
+                with _autocast_ctx(device, _dtype):
+                    loss, _ = compute_loss(model, batch)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                try:
+                    if _grad_clip is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), _grad_clip)
+                except Exception:
+                    pass
                 opt.step()
-                total += float(loss.item())
+                # Single .item() per step (was 2-3x when tracking/printing):
+                # one MPS sync instead of three, identical value reused.
+                loss_val = float(loss.item())
+                total += loss_val
                 n += 1
                 if tracker is not None and getattr(tracker, "active", False) and n % 10 == 0:
-                    tracker.log(n, {"loss": float(loss.item())})
-        final = evaluate(model, eval_loader, device=device)
+                    tracker.log(n, {"loss": loss_val})
+        final = evaluate(model, eval_loader, device=device, dtype=_dtype)
         print("[train] smoke final loss=%.4f ppl=%.2f (avg step loss=%.4f)" % (final["loss"], final["ppl"], total / max(1, n)))
         if not (final["loss"] < init["loss"]):
             # Retry once with more steps/higher LR before failing (deterministic).
@@ -844,12 +1046,17 @@ def main(argv=None):
                 opt2 = _new_optimizer(args, model, lr * 3)
                 for _ in range(20):
                     opt2.zero_grad(set_to_none=True)
-                    l, _ = compute_loss(model, batch)
+                    with _autocast_ctx(device, _dtype):
+                        l, _ = compute_loss(model, batch)
                     l.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    try:
+                        if _grad_clip is not None:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), _grad_clip)
+                    except Exception:
+                        pass
                     opt2.step()
                 break
-            final2 = evaluate(model, eval_loader, device=device)
+            final2 = evaluate(model, eval_loader, device=device, dtype=_dtype)
             print("[train] retry final loss=%.4f" % final2["loss"])
             final = final2
         if not (final["loss"] < init["loss"]):
@@ -913,6 +1120,15 @@ def main(argv=None):
             sample_texts = ["Once upon a time there was a little bunny."]
         tokenizer = SimpleTokenizer(sample_texts, vocab_size=8000)
         vocab_size = int(tokenizer.vocab_size)
+        try:
+            _nw = int(getattr(args, "num_workers", 0) or 0)
+        except Exception:
+            _nw = 0
+        try:
+            _pf = getattr(args, "prefetch_factor", None)
+            _pf = int(_pf) if _pf is not None else None
+        except Exception:
+            _pf = None
         loader = get_dataloader(
             tokenizer,
             split="train",
@@ -920,6 +1136,10 @@ def main(argv=None):
             batch_size=batch_size,
             max_examples=int(args.max_examples),
             shuffle=True,
+            num_workers=_nw,
+            persistent_workers=bool(_nw > 0),
+            prefetch_factor=_pf,
+            pin_memory=bool(getattr(args, "pin_memory", False)),
         )
         tok_vocab = tokenizer.to_dict()
     else:
@@ -939,6 +1159,7 @@ def main(argv=None):
     )
     model = _make_model(config)
     model.to(device)
+    model = _maybe_compile(model, getattr(args, "compile", False))
     opt = _new_optimizer(args, model, lr)
     tracker = _new_tracker(args, {
         "mode": "train", "data": args.data, "steps": steps, "seq_len": seq_len,
@@ -948,6 +1169,7 @@ def main(argv=None):
         "log_every": log_every,
         "optimizer": str(getattr(args, "optimizer", "adamw")),
         "muon_lr": float(getattr(args, "muon_lr", 0.02)),
+        "device": device, "dtype": _dtype,
     })
     if getattr(tracker, "active", False):
         print("[track] run dir: %s" % tracker.dir)
@@ -971,24 +1193,31 @@ def main(argv=None):
             except Exception:
                 pass
             opt.zero_grad(set_to_none=True)
-            loss, _ = compute_loss(model, batch)
+            with _autocast_ctx(device, _dtype):
+                loss, _ = compute_loss(model, batch)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            try:
+                if _grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), _grad_clip)
+            except Exception:
+                pass
             opt.step()
-            total += float(loss.item())
+            # Single sync per step: reuse loss_val for avg + tracker + print.
+            loss_val = float(loss.item())
+            total += loss_val
             it += 1
             if getattr(tracker, "active", False) and (it == 1 or it % log_every == 0):
                 try:
                     _lr_log = float(opt.param_groups[0]["lr"])
                 except Exception:
                     _lr_log = lr
-                tracker.log(it, {"loss": float(loss.item()), "lr": _lr_log})
+                tracker.log(it, {"loss": loss_val, "lr": _lr_log})
             if it == 1 or it % 100 == 0:
                 try:
                     _lr_now = float(opt.param_groups[0]["lr"])
                 except Exception:
                     _lr_now = lr
-                print("[train] step=%d/%d loss=%.4f lr=%.2e" % (it, steps, float(loss.item()), _lr_now), flush=True)
+                print("[train] step=%d/%d loss=%.4f lr=%.2e" % (it, steps, loss_val, _lr_now), flush=True)
         # If loader exhausted but steps remain and loader is finite, loop again.
         if it < steps:
             # For HF-backed loaders len may be 1 epoch; rebuild is overkill:
@@ -1001,7 +1230,7 @@ def main(argv=None):
     print("[train] done steps=%d avg_loss=%.4f" % (it, total / max(1, it)))
     ev_loss, ev_ppl = None, None
     try:
-        ev = evaluate(model, loader, device=device, max_batches=20)
+        ev = evaluate(model, loader, device=device, max_batches=20, dtype=_dtype)
         ev_loss, ev_ppl = float(ev["loss"]), float(ev["ppl"])
         print("[train] eval loss=%.4f ppl=%.2f" % (ev_loss, ev_ppl), flush=True)
     except Exception as e:

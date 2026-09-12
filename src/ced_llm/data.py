@@ -425,12 +425,22 @@ class _DictDataset(Dataset):
 
 
 def get_dataloader(
-    tokenizer, split="train", seq_len=128, batch_size=8, max_examples=500, shuffle=True
+    tokenizer, split="train", seq_len=128, batch_size=8, max_examples=500, shuffle=True,
+    num_workers=0, persistent_workers=False, prefetch_factor=None,
+    pin_memory=False,
 ):
     """Return a DataLoader yielding dicts {input_ids:[B,T], attention_mask:[B,T]}.
 
     Uses TensorDataset-style storage (via _DictDataset). T == seq_len.
     Works offline via synthetic fallback.
+
+    Loader-throughput knobs (all optional, defaults preserve the historical
+    single-process behavior exactly):
+      num_workers: DataLoader workers (0 = main-process only, as before).
+      persistent_workers: keep workers alive across epochs (only if >0).
+      prefetch_factor: batches prefetched per worker (None = torch default;
+        only forwarded when num_workers > 0, else torch raises).
+      pin_memory: page-locked host buffers for faster H2D copies.
     """
     try:
         seq_len = int(seq_len)
@@ -478,7 +488,31 @@ def get_dataloader(
     attention_mask = (input_ids != int(pad)).long()
 
     ds = _DictDataset(input_ids, attention_mask)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=bool(shuffle))
+    try:
+        nw = int(num_workers)
+    except Exception:
+        nw = 0
+    nw = max(0, nw)
+    try:
+        pin = bool(pin_memory)
+    except Exception:
+        pin = False
+    try:
+        persist = bool(persistent_workers) and nw > 0
+    except Exception:
+        persist = False
+    kw = dict(batch_size=batch_size, shuffle=bool(shuffle),
+              num_workers=nw, persistent_workers=persist, pin_memory=pin)
+    # torch raises if prefetch_factor is set with num_workers==0.
+    if nw > 0 and prefetch_factor is not None:
+        try:
+            kw["prefetch_factor"] = int(prefetch_factor)
+        except Exception:
+            pass
+    try:
+        loader = DataLoader(ds, **kw)
+    except Exception:
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=bool(shuffle))
     return loader
 
 

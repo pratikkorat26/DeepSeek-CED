@@ -15,7 +15,12 @@ class _EncoderBlock(nn.Module):
     def __init__(self, config: CEDConfig) -> None:
         super().__init__()
         self.ln_attn = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.self_attn = CausalSelfAttention(config.d_model, config.nhead, config.dropout)
+        self.self_attn = CausalSelfAttention(
+            config.d_model,
+            config.nhead,
+            config.dropout,
+            fused_qkv=bool(getattr(config, "use_fused_qkv", True)),
+        )
         self.ln_ff = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.fc1 = nn.Linear(config.d_model, config.dim_ff)
         self.fc2 = nn.Linear(config.dim_ff, config.d_model)

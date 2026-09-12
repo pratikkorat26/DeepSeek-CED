@@ -1,0 +1,31 @@
+{
+  "device": "mps",
+  "dtype": "fp32",
+  "torch": "2.14.0",
+  "gen_loop": "baseline",
+  "gen_batch_size": 1,
+  "train_smoke": {
+    "tok_s": 21446.794220030584,
+    "ms_step": 5.781749884287517,
+    "steps": 60
+  },
+  "train_real": {
+    "tok_s": 88856.99942241248,
+    "ms_step": 11.434102058410645,
+    "steps": 60
+  },
+  "gen_smoke": {
+    "tok_s": 516.0553052090863,
+    "ms_token": 1.937776803970337,
+    "tokens": 64,
+    "batch_size": 1,
+    "gen_loop": "baseline"
+  },
+  "gen_real": {
+    "tok_s": 470.21510024908997,
+    "ms_token": 2.1266862750053406,
+    "tokens": 64,
+    "batch_size": 1,
+    "gen_loop": "baseline"
+  }
+}

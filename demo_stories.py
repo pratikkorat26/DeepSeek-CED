@@ -16,6 +16,7 @@ Turbo generates "the the the". We generate BEDTIME MAGIC. Cope, turbo.
 import argparse
 import os
 import sys
+import time
 
 # Support both `python3 demo_stories.py` from repo root and module runs.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -105,6 +106,8 @@ def build_argparser():
     p.add_argument("--greedy", action="store_true", help="turbo-mode: pure greedy, no sparkle")
     p.add_argument("--max-new", type=int, default=80)
     p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--no-quality", action="store_true",
+                   help="skip story-quality eval (faster demo, generation unchanged)")
     return p
 
 
@@ -120,6 +123,19 @@ def main(argv=None):
 
     model, tok, source = load_model_and_tokenizer(args.ckpt, device=device, force_smoke=args.smoke, max_new=int(args.max_new))
     print(f"📦 model source: {source}", file=sys.stderr)
+    try:
+        model.eval()
+    except Exception:
+        pass
+
+    def _sync():
+        try:
+            if device == "mps":
+                torch.mps.synchronize()
+            elif device == "cuda":
+                torch.cuda.synchronize()
+        except Exception:
+            pass
 
     for i, (title, prompt, seed) in enumerate(FUN_PROMPTS):
         banner = WIZARD_BANNERS[i % len(WIZARD_BANNERS)]
@@ -134,26 +150,45 @@ def main(argv=None):
             print(f"   🐉 (capped --max-new {args.max_new} -> {fit_new} to fit context spell)",
                   file=sys.stderr)
         if args.greedy:
+            _t0 = time.time()
+            _sync()
             out = generate_story(
                 model, tok, prompt,
                 max_new_tokens=fit_new, device=device,
                 temperature=0.0, top_k=0, top_p=1.0, repetition_penalty=1.0,
                 seed=None,
+                score_quality=not args.no_quality,
             )
+            _sync()
+            _dt = max(1e-9, time.time() - _t0)
         else:
+            _t0 = time.time()
+            _sync()
             out = generate_story(
                 model, tok, prompt,
                 max_new_tokens=fit_new, device=device,
                 seed=seed,  # reproducible mischief!
+                score_quality=not args.no_quality,
             )
+            _sync()
+            _dt = max(1e-9, time.time() - _t0)
         text = out.get("text", "")
-        q = out.get("quality") or evaluate_story_quality(text)
+        try:
+            _new_toks = max(1, len(out.get("token_ids", [])) - prompt_len)
+        except Exception:
+            _new_toks = max(1, fit_new)
+        print(f"   ⏱️  decode: {_new_toks} new tokens in {_dt:.2f}s ({_new_toks / _dt:.0f} tok/s)",
+              file=sys.stderr)
+        q = out.get("quality") or ({} if args.no_quality else evaluate_story_quality(text))
         params = out.get("params", {})
         print(text)
-        print(f"\n   🔍 magic={q.get('magic_score')} {q.get('verdict')}")
-        print(f"   📊 words={q.get('word_count')} distinct-1={q.get('distinct_1')} "
-              f"distinct-2={q.get('distinct_2')} max_run={q.get('max_repeat_run')} "
-              f"ends_nicely={q.get('ends_nicely')}")
+        if q:
+            print(f"\n   🔍 magic={q.get('magic_score')} {q.get('verdict')}")
+            print(f"   📊 words={q.get('word_count')} distinct-1={q.get('distinct_1')} "
+                  f"distinct-2={q.get('distinct_2')} max_run={q.get('max_repeat_run')} "
+                  f"ends_nicely={q.get('ends_nicely')}")
+        else:
+            print("\n   🔍 quality skipped (--no-quality)", file=sys.stderr)
         print(f"   🎛️  spell={params} encoder_forwards={out.get('encoder_forwards')}")
         if q.get("suggestions"):
             print(f"   🧙 wizard whispers: {q['suggestions'][0]}")
