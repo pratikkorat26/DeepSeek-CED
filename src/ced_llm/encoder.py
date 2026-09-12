@@ -8,6 +8,11 @@ from torch import Tensor
 from .attention import CausalSelfAttention
 from .config import CEDConfig
 
+try:
+    from .moe import DeepSeekMoELayer
+except Exception:
+    DeepSeekMoELayer = None
+
 
 class _EncoderBlock(nn.Module):
     """One pre-norm block: causal self-attn + GELU FFN, each with residual + dropout."""
@@ -26,6 +31,29 @@ class _EncoderBlock(nn.Module):
         self.fc2 = nn.Linear(config.dim_ff, config.d_model)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(config.dropout)
+        # DeepSeekMoE FFN (V4.1 recipe); None == dense path, bit-identical.
+        self.moe_ffn = None
+        if DeepSeekMoELayer is not None and bool(getattr(config, "moe_enabled", False)):
+            try:
+                self.moe_ffn = DeepSeekMoELayer(
+                    config.d_model, config.dim_ff,
+                    num_experts=int(getattr(config, "moe_num_experts", 8)),
+                    top_k=int(getattr(config, "moe_top_k", 2)),
+                    shared_experts=int(getattr(config, "moe_shared_experts", 1)),
+                    expert_dim=int(getattr(config, "moe_expert_dim", 0)),
+                    routed_scaling=float(getattr(config, "moe_routed_scaling", 1.5)),
+                    norm_topk_prob=bool(getattr(config, "moe_norm_topk_prob", True)),
+                    scoring=str(getattr(config, "moe_scoring", "sqrtsoftplus")),
+                    balance_lr=float(getattr(config, "moe_balance_lr", 0.01)),
+                )
+            except Exception:
+                self.moe_ffn = None
+
+    def _ffn(self, h: Tensor) -> Tensor:
+        """Dense GELU FFN, or DeepSeekMoE when enabled (dropout applied by caller)."""
+        if self.moe_ffn is not None:
+            return self.moe_ffn(h)
+        return self.fc2(self.act(self.fc1(h)))
 
     def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """Apply the block: ``x + drop(attn(ln(x)))`` then ``h + drop(ffn(ln(h)))``."""
@@ -33,11 +61,14 @@ class _EncoderBlock(nn.Module):
         if self.training and self.dropout.p != 0.0:
             x = x + self.dropout(self.self_attn(self.ln_attn(x), key_padding_mask))
             h = self.ln_ff(x)
-            h = self.fc2(self.dropout(self.act(self.fc1(h))))
+            if self.moe_ffn is not None:
+                h = self.dropout(self.moe_ffn(h))
+            else:
+                h = self.fc2(self.dropout(self.act(self.fc1(h))))
             return x + self.dropout(h)
         x = x + self.self_attn(self.ln_attn(x), key_padding_mask)
         h = self.ln_ff(x)
-        h = self.fc2(self.act(self.fc1(h)))
+        h = self._ffn(h)
         return x + h
 
 

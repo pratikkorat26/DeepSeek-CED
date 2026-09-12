@@ -85,6 +85,19 @@ class CEDConfig:
     use_fused_qkv: bool = True
     use_static_cache: bool = True
     sdpa_backend: str = "auto"
+    # --- DeepSeekMoE (V4.1-Flash recipe; dense FFN by default) ---
+    # Official V4.1 text_config: 384 routed experts, top-6, 1 shared,
+    # sqrtsoftplus scoring, noaux_tc balancing, norm_topk_prob, 1.5x scaling.
+    # Toy defaults (8/2/1) preserve the exact mechanics at laptop scale.
+    moe_enabled: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_shared_experts: int = 1
+    moe_expert_dim: int = 0
+    moe_routed_scaling: float = 1.5
+    moe_norm_topk_prob: bool = True
+    moe_scoring: str = "sqrtsoftplus"
+    moe_balance_lr: float = 0.01
 
     def validate(self) -> None:
         """Validate the configuration, raising ``ValueError``/``TypeError`` on bad values."""
@@ -129,3 +142,16 @@ class CEDConfig:
             raise ValueError(
                 "sdpa_backend must be a str, got %r" % (self.sdpa_backend,)
             )
+        # MoE knobs: validated leniently so old checkpoints/configs keep working.
+        if getattr(self, "moe_enabled", False) not in (True, False, 0, 1):
+            raise ValueError("moe_enabled must be bool, got %r" % (self.moe_enabled,))
+        for _f, _lo in (("moe_num_experts", 1), ("moe_top_k", 1),
+                        ("moe_shared_experts", 0)):
+            try:
+                _v = int(getattr(self, _f, _lo))
+            except Exception:
+                raise ValueError("%s must be an int, got %r" % (_f, getattr(self, _f, None)))
+            if _v < _lo:
+                raise ValueError("%s must be >= %d, got %r" % (_f, _lo, _v))
+        if int(getattr(self, "moe_top_k", 1)) > int(getattr(self, "moe_num_experts", 1)):
+            raise ValueError("moe_top_k cannot exceed moe_num_experts")

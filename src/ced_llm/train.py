@@ -195,6 +195,19 @@ def _new_optimizer(args, model, lr):
     return torch.optim.AdamW(model.parameters(), lr=float(lr))
 
 
+def _apply_moe_args(config, args):
+    """Copy --moe CLI flags onto the config (dense default untouched)."""
+    try:
+        if bool(getattr(args, "moe", False)):
+            config.moe_enabled = True
+            config.moe_num_experts = max(1, int(getattr(args, "moe_experts", 8)))
+            config.moe_top_k = max(1, int(getattr(args, "moe_topk", 2)))
+            config.moe_shared_experts = max(0, int(getattr(args, "moe_shared", 1)))
+    except Exception:
+        pass
+    return config
+
+
 def _new_tracker(args, extra_config):
     """Build a RunTracker from CLI args (disabled with --no-track)."""
     try:
@@ -936,6 +949,14 @@ def build_argparser():
                    help="Muon learning rate for 2D params (Muon scale, not AdamW scale)")
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="Muon momentum coefficient")
+    p.add_argument("--moe", action="store_true",
+                   help="DeepSeekMoE FFN (V4.1 recipe: routed+shared experts) instead of dense")
+    p.add_argument("--moe-experts", type=int, default=8,
+                   help="routed experts per MoE layer (V4.1-Flash: 384)")
+    p.add_argument("--moe-topk", type=int, default=2,
+                   help="experts active per token (V4.1-Flash: 6)")
+    p.add_argument("--moe-shared", type=int, default=1,
+                   help="always-on shared experts (V4.1-Flash: 1)")
     # FORGE-LOOP speed flags (all defaults preserve CPU fp32 numerics exactly).
     p.add_argument("--device", type=str, default="cpu",
                    choices=["cpu", "mps", "cuda", "auto"],
@@ -992,6 +1013,7 @@ def main(argv=None):
         loader = _fixed_toy_loader(vocab_size, seq_len, batch_size, num_batches=8, seed=args.seed)
         eval_loader = loader
         config = _make_config(vocab_size, d_model, n_enc, n_dec, nhead, dim_ff, seq_len, 0.0, 0)
+        config = _apply_moe_args(config, args)
         model = _make_model(config)
         model.to(device)
         model = _maybe_compile(model, getattr(args, "compile", False))
@@ -1157,6 +1179,7 @@ def main(argv=None):
         vocab_size, d_model, int(args.n_enc), int(args.n_dec),
         nhead, dim_ff, seq_len, 0.0, 0,
     )
+    config = _apply_moe_args(config, args)
     model = _make_model(config)
     model.to(device)
     model = _maybe_compile(model, getattr(args, "compile", False))

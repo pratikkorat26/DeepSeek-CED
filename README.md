@@ -25,7 +25,7 @@ buy GPUs. (Turbo tried. Chaos cast spells. Docs won anyway.)
 pip install -r requirements.txt
 # torch>=2.0 and pytest are required; datasets/tiktoken are optional (fallback-covered)
 
-pytest -q                                        # 35 tests, ~2s, all green or riot
+pytest -q                                        # 43 tests, ~2s, all green or riot
 python3 -m src.ced_llm.train --smoke             # toy run: asserts loss goes DOWN
 python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encoder runs x1
 ```
@@ -33,7 +33,7 @@ python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encode
 Expected smoke output (don't panic if numbers wiggle slightly by torch version):
 
 ```
- 35 passed in ~2.2s
+ 43 passed in ~2.5s
 [train] SMOKE OK (loss 6.25 -> 4.83, the line goes down, stonks 📉📈)
 [generate] SMOKE OK (tokens=... encoder_forwards=1, the encoder took ONE nap... er, pass)
 ```
@@ -71,6 +71,26 @@ Convention: 2D params (matrices) → Muon at `--muon-lr` (Muon scale, ~0.02);
 biases/norms → AdamW at `--lr`. Zero new dependencies — `src/ced_llm/optim.py`
 is a self-contained reimplementation. The optimizer choice is recorded in
 every run's `config.json`, so comparisons stay honest.
+
+### MoE (DeepSeekMoE à la V4.1-Flash)
+
+The FFN in every layer can switch to the exact V4.1-Flash MoE recipe
+(official `text_config`): routed experts + shared expert, `sqrtsoftplus`
+scoring, aux-loss-free (`noaux_tc`) bias balancing, top-k renormalization,
+1.5× routed scaling. Toy scale defaults: 8 experts, top-2, 1 shared
+(theirs: 384/6/1) — same mechanics, laptop budget:
+
+```bash
+python3 -m src.ced_llm.train --smoke --moe
+python3 -m src.ced_llm.train --data tinystories --steps 500 --moe \
+  --moe-experts 8 --moe-topk 2 --ckpt ckpt-moe.pt
+python3 examples/moe_asymmetry.py   # SEE the asymmetry: prefill-active vs
+                                    # decode-active params + live expert histogram
+```
+
+Dense stays default (`--moe` off = bit-identical). The demo prints the
+signature V4.1 shape: prefill activates the encoder subset, decode the
+decoder subset (~24% vs ~27% of params at toy scale; theirs: 8B/16B).
 
 ---
 
@@ -135,7 +155,7 @@ MPS tiny-shape timing is noisy ±15–30%, CPU is stable):
 
 | Workload | Command | Apple M4 result |
 |---|---|---|
-| Full test suite (35 tests) | `pytest -q` | ~2.1s, 35/35 green |
+| Full test suite (43 tests) | `pytest -q` | ~2.5s, 43/43 green |
 | Train smoke (60 toy steps) | `python3 -m src.ced_llm.train --smoke` | loss `6.25 → 4.83`, asserts final < initial |
 | Generate smoke (16 tokens) | `python3 -m src.ced_llm.generate --smoke` | `encoder_forwards=1`, proves KV-reuse |
 | Train, MPS (d=128, 2+2, B=8, T=128) | `benchmarks/speed.py --device mps` | **~89k tok/s** (11.4 ms/step) |
@@ -242,6 +262,7 @@ src/ced_llm/model.py      # CEDForLM: embed ONCE, encode_once, init_decode_cache
 src/ced_llm/data.py       # SimpleTokenizer, TinyStories loader + synthetic fallback, encode_pack
 src/ced_llm/train.py      # compute_loss / train_one_epoch / evaluate / CLI (--smoke toy run, --run-dir tracking)
 src/ced_llm/optim.py      # Muon (Newton-Schulz) + AdamW hybrid factory, torch-only, zero new deps
+src/ced_llm/moe.py        # DeepSeekMoE (V4.1 recipe: sqrtsoftplus, noaux, shared+routed) + active-param accounting
 src/ced_llm/tracking.py   # RunTracker: offline JSONL runs + optional TensorBoard mirror
 src/ced_llm/eval.py       # perplexity + 3 samples CLI (--smoke, --ckpt, --run-dir)
 src/ced_llm/generate.py   # generate_greedy (cache-once + step loop) / sampling spells / CLI
@@ -254,6 +275,8 @@ tests/test_training.py    # Toy overfit, grad flow to encoder, padding invarianc
 tests/test_edgecases_docs.py  # DOC-BOSS: empty prompt, single token, truncation, temp=0 (7 tests)
 tests/test_tracking.py      # RunTracker layout, disabled mode, TB fallback, smoke end-to-end
 tests/test_optim.py         # Newton-Schulz band, Muon descent, hybrid routing, muon smoke
+tests/test_moe.py           # sqrtsoftplus, top-k+renorm, shared always-on, noaux bias, moe smoke
+examples/moe_asymmetry.py   # prefill vs decode active params + live expert histogram
 ARCHITECTURE.md           # Deep dive: encoder-once + KV-reuse with ASCII traces
 CONTRIBUTING.md           # How to contribute without summoning demons
 requirements.txt          # torch+pytest required; datasets/tiktoken optional (commented)

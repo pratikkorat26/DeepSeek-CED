@@ -24,6 +24,11 @@ from .attention import (
 )
 from .config import CEDConfig
 
+try:
+    from .moe import DeepSeekMoELayer
+except Exception:
+    DeepSeekMoELayer = None
+
 # A per-layer self-attention KV cache: head-split keys/values, (K, V) each
 # of shape [B, H, T_past, Dh], or None for an empty cache.
 KVCache = Optional[Tuple[Tensor, Tensor]]
@@ -54,6 +59,23 @@ class DecoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.dim_ff, config.d_model)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(config.dropout)
+        # DeepSeekMoE FFN (V4.1 recipe); None == dense path, bit-identical.
+        self.moe_ffn = None
+        if DeepSeekMoELayer is not None and bool(getattr(config, "moe_enabled", False)):
+            try:
+                self.moe_ffn = DeepSeekMoELayer(
+                    config.d_model, config.dim_ff,
+                    num_experts=int(getattr(config, "moe_num_experts", 8)),
+                    top_k=int(getattr(config, "moe_top_k", 2)),
+                    shared_experts=int(getattr(config, "moe_shared_experts", 1)),
+                    expert_dim=int(getattr(config, "moe_expert_dim", 0)),
+                    routed_scaling=float(getattr(config, "moe_routed_scaling", 1.5)),
+                    norm_topk_prob=bool(getattr(config, "moe_norm_topk_prob", True)),
+                    scoring=str(getattr(config, "moe_scoring", "sqrtsoftplus")),
+                    balance_lr=float(getattr(config, "moe_balance_lr", 0.01)),
+                )
+            except Exception:
+                self.moe_ffn = None
         # Fused self-QKV (3->1 GEMM) + inference weight-stack cache.
         self.use_fused_qkv = bool(getattr(config, "use_fused_qkv", True))
         self._fused_weight: Optional[Tensor] = None
@@ -278,8 +300,12 @@ class DecoderLayer(nn.Module):
         return self.self_out_proj(merge_heads(y)), k_buf, v_buf, k_full, v_full
 
     def _ffn(self, h_norm: Tensor) -> Tensor:
-        """Token-wise GELU feed-forward network."""
+        """Token-wise feed-forward: dense GELU, or DeepSeekMoE when enabled."""
         # Skip dropout dispatch when identity.
+        if self.moe_ffn is not None:
+            if self.training and self.dropout.p != 0.0:
+                return self.dropout(self.moe_ffn(h_norm))
+            return self.moe_ffn(h_norm)
         if self.training and self.dropout.p != 0.0:
             return self.fc2(self.dropout(self.act(self.fc1(h_norm))))
         return self.fc2(self.act(self.fc1(h_norm)))
