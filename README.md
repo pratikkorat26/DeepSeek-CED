@@ -1,4 +1,4 @@
-# DeepSeek-CER: Minimal Dense CED LLM ⚡📚
+# CED: Minimal Dense Context-Encoder-Decoder LLM ⚡📚
 
 [![CI](https://img.shields.io/badge/CI-22%2F22%20green-brightgreen)](.github/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](pyproject.toml)
