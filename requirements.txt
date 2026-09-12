@@ -6,7 +6,7 @@
 # --- Core (REQUIRED) ---
 # torch: model + train + generate (SDPA attention needs torch>=2.0).
 torch>=2.0
-# pytest: test runner (pytest -q must stay 49/49 green).
+# pytest: test runner (pytest -q must stay 53/53 green).
 pytest
 
 # --- Optional (FALLBACK-COVERED: safe to skip; repo works fully offline without them) ---

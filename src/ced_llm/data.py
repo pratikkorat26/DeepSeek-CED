@@ -511,18 +511,29 @@ def encode_pack(texts, tokenizer, seq_len):
 class _DictDataset(Dataset):
     """Map-style dataset yielding dicts {input_ids, attention_mask}."""
 
-    def __init__(self, input_ids, attention_mask):
+    def __init__(self, input_ids, attention_mask, labels=None):
         self.input_ids = input_ids
         self.attention_mask = attention_mask
+        self.labels = labels
 
     def __len__(self):
-        return self.input_ids.size(0)
+        try:
+            return int(self.input_ids.size(0))
+        except Exception:
+            return len(self.input_ids)
 
     def __getitem__(self, idx):
-        return {
+        out = {
             "input_ids": self.input_ids[idx],
             "attention_mask": self.attention_mask[idx],
         }
+        # SFT batches carry per-token labels (-100 = masked prompt/pad).
+        if self.labels is not None:
+            try:
+                out["labels"] = self.labels[idx]
+            except Exception:
+                pass
+        return out
 
 
 def get_dataloader(

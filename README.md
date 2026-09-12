@@ -25,7 +25,7 @@ buy GPUs. (Turbo tried. Chaos cast spells. Docs won anyway.)
 pip install -r requirements.txt
 # torch>=2.0 and pytest are required; datasets/tiktoken are optional (fallback-covered)
 
-pytest -q                                        # 49 tests, ~3s, all green or riot
+pytest -q                                        # 53 tests, ~3s, all green or riot
 python3 -m src.ced_llm.train --smoke             # toy run: asserts loss goes DOWN
 python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encoder runs x1
 ```
@@ -33,7 +33,7 @@ python3 -m src.ced_llm.generate --smoke          # tiny model, 16 tokens, encode
 Expected smoke output (don't panic if numbers wiggle slightly by torch version):
 
 ```
- 49 passed in ~2.8s
+ 53 passed in ~3.1s
 [train] SMOKE OK (loss 6.25 -> 4.83, the line goes down, stonks 📉📈)
 [generate] SMOKE OK (tokens=... encoder_forwards=1, the encoder took ONE nap... er, pass)
 ```
@@ -75,6 +75,32 @@ Story-shaped, narrative rhythm intact — with `<unk>` confetti betraying the
 word-level tokenizer (see Tokenizer section for the GPT-2 fix). Explicit
 flags always override the preset; `max_examples=5000` is what makes 3000
 steps reachable under the finite-loader guard.
+
+### Alignment, toy-scale: SFT (follow instructions, don't just continue)
+
+Base models complete; aligned models *obey*. The SFT stage fine-tunes any
+checkpoint on synthetic (instruction, response) pairs — story requests,
+continuations, follow-up questions — with the prompt masked (`-100`) so
+loss trains on response tokens only (stage 1 of real alignment pipelines):
+
+```bash
+python3 -m src.ced_llm.train --data instructions --init checkpoints/tinysmall.pt \
+  --steps 300 --lr 1e-4 --batch-size 8 --max-examples 200 \
+  --ckpt checkpoints/tinysmall-sft.pt --device mps --seed 1
+# [train] done steps=300 | eval loss=0.12 ppl=1.12
+```
+
+Before → after on `"Tell me a short story about a bunny."`:
+
+```
+base: ...about a bunny. him an her too day, a girl. park. named not walking...
+sft:  ...about a bunny. once upon a time there was a a girl. a girl in a they...
+```
+
+Fragment-echo becomes story-opening. Modest — 300 steps on 200 synthetic
+pairs with 3.8M params — but the mechanism (masked targets, ckpt resume via
+`--init`, arch-from-ckpt) is exactly the production shape. Flags:
+`--data instructions`, `--init CKPT`, `--moe` composes too.
 
 ### Optimizer (AdamW vs Muon)
 
@@ -191,7 +217,7 @@ MPS tiny-shape timing is noisy ±15–30%, CPU is stable):
 
 | Workload | Command | Apple M4 result |
 |---|---|---|
-| Full test suite (49 tests) | `pytest -q` | ~2.8s, 49/49 green |
+| Full test suite (53 tests) | `pytest -q` | ~3.1s, 53/53 green |
 | Train smoke (60 toy steps) | `python3 -m src.ced_llm.train --smoke` | loss `6.25 → 4.83`, asserts final < initial |
 | Generate smoke (16 tokens) | `python3 -m src.ced_llm.generate --smoke` | `encoder_forwards=1`, proves KV-reuse |
 | Train, MPS (d=128, 2+2, B=8, T=128) | `benchmarks/speed.py --device mps` | **~89k tok/s** (11.4 ms/step) |
@@ -299,6 +325,7 @@ src/ced_llm/data.py       # SimpleTokenizer, TinyStories loader + synthetic fall
 src/ced_llm/train.py      # compute_loss / train_one_epoch / evaluate / CLI (--smoke toy run, --run-dir tracking)
 src/ced_llm/optim.py      # Muon (Newton-Schulz) + AdamW hybrid factory, torch-only, zero new deps
 src/ced_llm/moe.py        # DeepSeekMoE (V4.1 recipe: sqrtsoftplus, noaux, shared+routed) + active-param accounting
+src/ced_llm/sft.py        # instruction pairs + response-only labels (SFT stage)
 src/ced_llm/tracking.py   # RunTracker: offline JSONL runs + optional TensorBoard mirror
 src/ced_llm/eval.py       # perplexity + 3 samples CLI (--smoke, --ckpt, --run-dir)
 src/ced_llm/generate.py   # generate_greedy (cache-once + step loop) / sampling spells / CLI
@@ -313,6 +340,7 @@ tests/test_tracking.py      # RunTracker layout, disabled mode, TB fallback, smo
 tests/test_optim.py         # Newton-Schulz band, Muon descent, hybrid routing, muon smoke
 tests/test_moe.py           # sqrtsoftplus, top-k+renorm, shared always-on, noaux bias, moe smoke
 tests/test_tokenizer.py     # GPT-2 wrapper (stubbed tiktoken), offline fallback, ckpt kind roundtrip
+tests/test_sft.py           # pair modes, prompt-masking proof, instructions quick run
 examples/moe_asymmetry.py   # prefill vs decode active params + live expert histogram
 ARCHITECTURE.md           # Deep dive: encoder-once + KV-reuse with ASCII traces
 CONTRIBUTING.md           # How to contribute without summoning demons
