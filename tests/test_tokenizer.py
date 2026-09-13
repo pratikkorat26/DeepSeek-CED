@@ -1,7 +1,7 @@
 """Tests for GPT-2 tokenizer wrapper + factory (offline-first).
 
-tiktoken is NOT installed in this env, so real-BPE tests use a stubbed
-``tiktoken`` module; the missing-dep fallback path is tested for real.
+The fallback tests explicitly simulate a missing optional dependency, so the
+suite remains valid whether tiktoken is installed in the test environment.
 All offline, CPU, fast.
 """
 
@@ -9,6 +9,7 @@ import sys
 import types
 
 try:
+    import src.ced_llm.data as _data_module
     from src.ced_llm.data import (
         GPT2Tokenizer,
         SimpleTokenizer,
@@ -16,6 +17,7 @@ try:
         encode_pack,
     )
 except ImportError:
+    import ced_llm.data as _data_module  # type: ignore
     from ced_llm.data import (  # type: ignore
         GPT2Tokenizer,
         SimpleTokenizer,
@@ -49,9 +51,9 @@ def test_factory_defaults_to_simple():
     assert kind == "simple"
 
 
-def test_factory_gpt2_falls_back_offline(capsys):
-    # tiktoken is not installed here: must warn + return SimpleTokenizer.
-    assert "tiktoken" not in sys.modules
+def test_factory_gpt2_falls_back_offline(monkeypatch, capsys):
+    # Simulate a missing optional dependency even when installed globally.
+    monkeypatch.setattr(_data_module, "try_load_gpt2_tokenizer", lambda: None)
     tok, kind = build_tokenizer("gpt2", ["hello world"])
     assert kind == "simple" and isinstance(tok, SimpleTokenizer)
     assert "falling back" in capsys.readouterr().out
@@ -83,17 +85,17 @@ def test_encode_pack_with_gpt2_wrapper(monkeypatch):
     assert rows[1].count(100) > 0  # short row gets real padding
 
 
-def test_train_smoke_tokenizer_gpt2_falls_back(tmp_path):
+def test_train_smoke_tokenizer_gpt2_falls_back(tmp_path, monkeypatch):
     try:
         from src.ced_llm.train import main as train_main
     except ImportError:
         from ced_llm.train import main as train_main
-    assert "tiktoken" not in sys.modules
+    monkeypatch.setattr(_data_module, "try_load_gpt2_tokenizer", lambda: None)
     rc = train_main(["--smoke", "--tokenizer", "gpt2", "--no-track"])
     assert rc == 0
 
 
-def test_ckpt_kind_tag_and_gpt2_rebuild_graceful(tmp_path, capsys):
+def test_ckpt_kind_tag_and_gpt2_rebuild_graceful(tmp_path, capsys, monkeypatch):
     import torch
 
     try:
@@ -114,6 +116,7 @@ def test_ckpt_kind_tag_and_gpt2_rebuild_graceful(tmp_path, capsys):
     payload["tokenizer_kind"] = "gpt2"
     payload["tokenizer_vocab"] = _ST(["hello world"], vocab_size=64).to_dict()
     torch.save(payload, ckpt)
+    monkeypatch.setattr(_data_module, "try_load_gpt2_tokenizer", lambda: None)
     try:
         from src.ced_llm.generate import _try_load_ckpt
     except ImportError:

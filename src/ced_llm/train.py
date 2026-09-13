@@ -195,72 +195,6 @@ def _new_optimizer(args, model, lr):
     return torch.optim.AdamW(model.parameters(), lr=float(lr))
 
 
-def _load_init_ckpt(path):
-    """Load --init ckpt -> (model_state|None, tokenizer|None, config_dict|None).
-
-    Never raises: missing file/bad payload yields Nones with a warning
-    (caller falls back to fresh init). Tokenizer rebuilt from the ckpt's
-    own vocab (gpt2 kind needs tiktoken, else None + warning).
-    """
-    if not path:
-        return None, None, None
-    try:
-        data = torch.load(str(path), map_location="cpu", weights_only=False)
-    except Exception as e:
-        print("[train] WARNING: --init load failed (%r); fresh init." % (e,))
-        return None, None, None
-    if not isinstance(data, dict):
-        print("[train] WARNING: --init ckpt not a dict; fresh init.")
-        return None, None, None
-    try:
-        cfg_d = data.get("config", {}) or {}
-        if not isinstance(cfg_d, dict):
-            try:
-                cfg_d = dict(vars(cfg_d))
-            except Exception:
-                cfg_d = {}
-    except Exception:
-        cfg_d = {}
-    try:
-        ms = data.get("model_state", data.get("state_dict", None))
-    except Exception:
-        ms = None
-    tok = None
-    try:
-        kind = data.get("tokenizer_kind", None)
-        tv = data.get("tokenizer_vocab", None)
-        if kind == "gpt2":
-            try:
-                from .data import build_tokenizer as _bt
-            except Exception:
-                try:
-                    from src.ced_llm.data import build_tokenizer as _bt  # type: ignore
-                except Exception:
-                    _bt = None
-            if _bt is not None:
-                tok, actual = _bt("gpt2")
-                if actual != "gpt2" or tok is None:
-                    print("[train] WARNING: init ckpt is gpt2 but tiktoken "
-                          "unavailable; tokenizer=None.", file=sys.stderr)
-                    tok = None
-        elif isinstance(tv, dict):
-            try:
-                from .data import SimpleTokenizer as _ST
-            except Exception:
-                try:
-                    from src.ced_llm.data import SimpleTokenizer as _ST  # type: ignore
-                except Exception:
-                    _ST = None
-            if _ST is not None:
-                try:
-                    tok = _ST.from_dict(tv) if "token_to_id" in tv else _ST.from_vocab(tv)
-                except Exception:
-                    tok = None
-    except Exception:
-        tok = None
-    return ms, tok, cfg_d
-
-
 def _apply_moe_args(config, args):
     """Copy --moe CLI flags onto the config (dense default untouched)."""
     try:
@@ -679,11 +613,6 @@ def compute_loss(model, batch, pad_token_id=None):
     logits_out = model(input_ids=x_in, attention_mask=mask_in)['logits']
     loss = CE(logits.view(-1,V), y.view(-1), ignore_index=pad)
     Returns (loss, logits).
-
-    SFT batches may carry ``labels`` (full-length, ``-100`` = masked prompt):
-    when present they are shifted alongside the inputs and used with
-    ``ignore_index=-100`` (pad positions remapped to -100 too). Batches
-    without labels take the exact historical path (bit-identical).
     """
     try:
         x = batch["input_ids"]
@@ -694,12 +623,6 @@ def compute_loss(model, batch, pad_token_id=None):
         mask = batch.get("attention_mask", None) if isinstance(batch, dict) else batch[1]
     except Exception:
         mask = None
-    y_in = None
-    if isinstance(batch, dict):
-        try:
-            y_in = batch.get("labels", None)
-        except Exception:
-            y_in = None
     if not isinstance(x, torch.Tensor):
         x = torch.as_tensor(x, dtype=torch.long)
     if mask is not None and not isinstance(mask, torch.Tensor):
@@ -730,29 +653,13 @@ def compute_loss(model, batch, pad_token_id=None):
     if x.size(1) < 2:
         raise ValueError("seq_len must be >= 2 for shifted LM loss")
     x_in = x[:, :-1]
+    y = x[:, 1:]
     mask_in = mask[:, :-1] if isinstance(mask, torch.Tensor) else None
     pad = _infer_pad_id(model, pad_token_id)
-    use_labels = isinstance(y_in, torch.Tensor) and y_in.shape == x.shape
-    if use_labels:
-        try:
-            if y_in.device != x.device:
-                y_in = y_in.to(x.device)
-        except Exception:
-            pass
     out = model(input_ids=x_in, attention_mask=mask_in)
     logits = _extract_logits(out)
-    if use_labels:
-        y = y_in[:, 1:]
-        try:
-            y = torch.where(y == int(pad), torch.full_like(y, -100), y)
-        except Exception:
-            pass
-        ignore = -100
-    else:
-        y = x[:, 1:]
-        ignore = int(pad)
     loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=ignore
+        logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=int(pad)
     )
     return loss, logits
 
@@ -1042,9 +949,7 @@ def build_argparser(preset=None):
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--data", type=str, default="toy", choices=["toy", "tinystories", "instructions"])
-    p.add_argument("--init", type=str, default=None,
-                   help="init model + tokenizer from ckpt (SFT stage); architecture comes from the ckpt")
+    p.add_argument("--data", type=str, default="toy", choices=["toy", "tinystories"])
     p.add_argument("--max-examples", type=int, default=500)
     p.add_argument("--ckpt", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -1270,13 +1175,6 @@ def main(argv=None):
     except Exception:
         log_every = 20
 
-    # SFT/resume init: architecture + tokenizer + weights come from the ckpt.
-    init_state, init_tok, init_cfg = None, None, None
-    if getattr(args, "init", None):
-        init_state, init_tok, init_cfg = _load_init_ckpt(getattr(args, "init"))
-        if init_cfg:
-            print("[train] init: architecture from ckpt %s" % getattr(args, "init"))
-
     if args.data == "tinystories":
         # Build tokenizer from a small corpus sample, then dataloader.
         print("[train] loading TinyStories (offline-safe) ...")
@@ -1305,11 +1203,6 @@ def main(argv=None):
         else:  # pragma: no cover - data import failed; legacy path
             tokenizer, tok_kind = SimpleTokenizer(sample_texts, vocab_size=8000), "simple"
         vocab_size = int(tokenizer.vocab_size)
-        if init_tok is not None:
-            # SFT/resume: ckpt vocab ids must match ckpt embeddings.
-            tokenizer = init_tok
-            vocab_size = int(tokenizer.vocab_size)
-            print("[train] using init ckpt tokenizer (vocab=%d)" % vocab_size)
         try:
             _nw = int(getattr(args, "num_workers", 0) or 0)
         except Exception:
@@ -1333,52 +1226,6 @@ def main(argv=None):
         )
         tok_vocab = tokenizer.to_dict()
         tok_kind = tok_kind if isinstance(tok_kind, str) else "simple"
-    elif args.data == "instructions":
-        # SFT stage: (prompt, response) pairs, loss on response tokens only.
-        try:
-            from .sft import build_instruction_pairs, get_sft_dataloader
-        except Exception:
-            try:
-                from src.ced_llm.sft import (  # type: ignore
-                    build_instruction_pairs, get_sft_dataloader)
-            except Exception:
-                build_instruction_pairs = None
-                get_sft_dataloader = None
-        if get_sft_dataloader is None:
-            print("[train] WARNING: sft module missing; toy fallback.",
-                  file=sys.stderr)
-            vocab_size = 512
-            tokenizer = None
-            tok_vocab = None
-            tok_kind = "simple"
-            loader = _fixed_toy_loader(vocab_size, seq_len, batch_size,
-                                       num_batches=16, seed=args.seed)
-        else:
-            if init_tok is not None:
-                tokenizer = init_tok
-                print("[train] using init ckpt tokenizer (vocab=%d)"
-                      % int(tokenizer.vocab_size))
-            else:
-                try:
-                    _pairs0 = build_instruction_pairs(
-                        max(32, int(args.max_examples)), int(args.seed))
-                    _texts0 = [r for _, r in _pairs0]
-                except Exception:
-                    _texts0 = ["Once upon a time there was a little bunny."]
-                tokenizer = SimpleTokenizer(_texts0, vocab_size=8000)
-            vocab_size = int(tokenizer.vocab_size)
-            loader = get_sft_dataloader(
-                tokenizer, seq_len=seq_len, batch_size=batch_size,
-                max_examples=int(args.max_examples), seed=int(args.seed),
-                shuffle=True)
-            try:
-                tok_vocab = tokenizer.to_dict()
-            except Exception:
-                tok_vocab = None
-            try:
-                tok_kind = str(getattr(tokenizer, "kind", "simple"))
-            except Exception:
-                tok_kind = "simple"
     else:
         vocab_size = 512
         tokenizer = None
@@ -1391,32 +1238,13 @@ def main(argv=None):
     d_model = int(args.d_model)
     nhead = _resolve_nhead(d_model, int(args.nhead))
     dim_ff = 4 * d_model
-    if init_cfg:
-        # SFT/resume: architecture comes from the ckpt (CLI size flags yield).
-        try:
-            vocab_size = int(init_cfg.get("vocab_size", vocab_size))
-            d_model = int(init_cfg.get("d_model", d_model))
-            nhead = _resolve_nhead(d_model, int(init_cfg.get("nhead", nhead)))
-            dim_ff = int(init_cfg.get("dim_ff", 4 * d_model))
-            _n_enc = int(init_cfg.get("n_enc_layers", int(args.n_enc)))
-            _n_dec = int(init_cfg.get("n_dec_layers", int(args.n_dec)))
-        except Exception:
-            _n_enc, _n_dec = int(args.n_enc), int(args.n_dec)
-    else:
-        _n_enc, _n_dec = int(args.n_enc), int(args.n_dec)
     config = _make_config(
-        vocab_size, d_model, _n_enc, _n_dec,
+        vocab_size, d_model, int(args.n_enc), int(args.n_dec),
         nhead, dim_ff, seq_len, 0.0, 0,
     )
     config = _apply_moe_args(config, args)
     model = _make_model(config)
     model.to(device)
-    if init_state is not None:
-        try:
-            model.load_state_dict(init_state, strict=False)
-            print("[train] init: loaded ckpt weights (strict=False)")
-        except Exception as e:
-            print("[train] WARNING: init weights load failed (%r); fresh init." % (e,))
     model = _maybe_compile(model, getattr(args, "compile", False))
     opt = _new_optimizer(args, model, lr)
     tracker = _new_tracker(args, {
